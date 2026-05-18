@@ -7,10 +7,12 @@
     "test": "node --test"
   },
   "bin": {
-    "bnz": "./bnz.js"
+    "bnz": "./bnz.js",
+    "bnz-mcp": "./mcp-server/server.js"
   },
   "dependencies": {
     "@joplin/turndown-plugin-gfm": "^1.0.67",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "playwright": "^1.48.0",
     "turndown": "^7.2.4"
   }
