@@ -17,15 +17,36 @@ attachment download URLs, reproducer endpoints).
 
 ## Install
 
+Create a packaged global installation rather than linking the checkout:
+
 ```sh
 git clone <this repo> ~/repos/bnz
 cd ~/repos/bnz
-npm install
+npm ci
 npx playwright install chromium
+archive="$(npm pack --pack-destination /tmp)"
+sudo npm install --global "/tmp/$archive"
 ```
 
-Add `~/repos/bnz` to your `PATH` so `bnz` is on it (the repo ships a `bnz`
-symlink to `bnz.js`).
+This installs both `bnz` and `bnz-mcp` on the system `PATH`. Installing the
+checkout itself with `npm install --global .` creates a symlink back into the
+checkout. That is convenient for development, but it is not a self-contained
+tool installation and sandbox launchers may refuse to mount it. Installing the
+tarball copies only the package's declared files into npm's global tool tree.
+
+To update an existing installation after changing the source, rerun the
+`archive=...` and `npm install --global` commands shown above. The install
+replaces the previous package while keeping bnz's profile and cache under
+`~/.config/bnz` untouched.
+
+For development and tests, use the checkout directly without installing it:
+
+```sh
+npm ci
+npm test
+./bnz.js --help
+node ./mcp-server/server.js
+```
 
 ## First-time login
 
