@@ -26,8 +26,10 @@ cd ~/repos/bnz
 ```
 
 Run the script as your normal user; it invokes `sudo` for the global npm
-installation. It installs dependencies and Chromium, packs the checkout into
-a temporary directory, installs the archive globally, and removes it afterward.
+installation. It packs the checkout into a temporary directory, installs the
+archive and its dependencies globally, installs Chromium using that installed
+Playwright version, and removes the archive afterward. Chromium is downloaded
+as your normal user so `bnz` finds it in your browser cache.
 The script works from any working directory.
 
 This installs both `bnz` and `bnz-mcp` on the system `PATH`. Installing the
