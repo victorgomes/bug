@@ -39,6 +39,10 @@ test('resolves only known https issue URLs', () => {
 
 test('resolves ClusterFuzz targets without accepting lookalike hosts', () => {
   assert.deepEqual(
+    resolveCfTarget('https://clusterfuzz.com/testcase-detail/6005188368302080'),
+    { kind: 'testcase', key: '6005188368302080' },
+  );
+  assert.deepEqual(
     resolveCfTarget('https://clusterfuzz.com/testcase?key=5009280990216192'),
     { kind: 'testcase', key: '5009280990216192' },
   );

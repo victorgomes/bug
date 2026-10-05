@@ -10,6 +10,11 @@
     "bnz": "./bnz.js",
     "bnz-mcp": "./mcp-server/server.js"
   },
+  "files": [
+    "bnz.js",
+    "lib",
+    "mcp-server"
+  ],
   "dependencies": {
     "@joplin/turndown-plugin-gfm": "^1.0.67",
     "@modelcontextprotocol/sdk": "^1.29.0",
