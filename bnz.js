@@ -24,9 +24,9 @@ import {
 import {
   appendix, header, makeColors, sanitizeDeep, sanitizeTerminalText,
 } from './lib/render.js';
-
-const CLUSTERFUZZ_TESTCASE_RE =
-  /clusterfuzz\.com\/(?:testcase\?key=|download\?testcase_id=)(\d+)/;
+import {
+  CLUSTERFUZZ_TESTCASE_RE, downloadTestcases, findTestcaseKeysInMarkdown, readCfInputs,
+} from './lib/cf-download.js';
 
 // ---------- arg parsing ----------
 
@@ -40,12 +40,19 @@ Usage:
   bnz <id|url> [<id|url>...]             Fetch one or more issues.
   bnz cf <key|url|issue-id> [...]        Fetch one or more clusterfuzz testcases.
                                          (Numeric input: 14+ digits = testcase key.)
+                                         IDs may be comma-separated, quoted or unquoted.
   bnz list "<query>"                     Search issuetracker (raw Buganizer query syntax).
 
 Flags:
   --format=markdown|json                 Output format. markdown is the default; json emits a
                                          structured object (or array, for multiple targets).
   --download-original                    cf: also fetch the original (unminimized) reproducer.
+  --download[=DIR]                       cf: save testcase files (default DIR: cwd), without a page dump.
+  --variant=minimized|original|both      cf --download: select files (default: minimized).
+  --ids-file=FILE                        cf: read whitespace/comma-separated IDs or URLs; - for stdin.
+                                         A positional - also reads targets from stdin.
+                                         With no targets, redirected stdin is read automatically.
+  --jobs=N                              cf --download: concurrent downloads (default 4, maximum 16).
   --download-attachments[=DIR]           Download all attachment URLs found on the page(s).
                                          DIR defaults to the cwd. Filenames come from the link
                                          text where available, else the URL basename.
@@ -74,6 +81,8 @@ function parseArgs(argv) {
     refresh: false,
     downloadOriginal: false,
     downloadAttachments: null,
+    download: null,
+    jobs: 4,
   };
   for (const a of argv) {
     if (a === '--help' || a === '-h') args.help = true;
@@ -83,6 +92,11 @@ function parseArgs(argv) {
     else if (a === '--refresh') args.refresh = true;
     else if (a === '--no-cache') args.useCache = false;
     else if (a === '--download-original') args.downloadOriginal = true;
+    else if (a === '--download') args.download = '.';
+    else if (a.startsWith('--download=')) args.download = a.slice('--download='.length);
+    else if (a.startsWith('--variant=')) args.variant = a.slice('--variant='.length);
+    else if (a.startsWith('--ids-file=')) args.idsFile = a.slice('--ids-file='.length);
+    else if (a.startsWith('--jobs=')) args.jobs = Number(a.slice('--jobs='.length));
     else if (a === '--download-attachments') args.downloadAttachments = '.';
     else if (a.startsWith('--download-attachments=')) {
       args.downloadAttachments = a.slice('--download-attachments='.length);
@@ -95,14 +109,24 @@ function parseArgs(argv) {
   if (!['markdown', 'json'].includes(args.format)) {
     throw new Error(`Unknown --format: ${args.format} (expected markdown or json)`);
   }
+  args.variant ??= args.downloadOriginal ? 'both' : 'minimized';
+  if (!['minimized', 'original', 'both'].includes(args.variant)) {
+    throw new Error('Expected --variant=minimized|original|both');
+  }
+  if (!Number.isInteger(args.jobs) || args.jobs < 1 || args.jobs > 16) {
+    throw new Error('--jobs must be an integer from 1 to 16');
+  }
+  if (args.download === '' || args.idsFile === '') throw new Error('Expected a nonempty path');
+  if ((args.download || args.idsFile || args._.includes('-')) && args._[0] !== 'cf') {
+    throw new Error('--download, --ids-file and stdin targets require cf');
+  }
   return args;
 }
 
 // ---------- fetching ----------
 
 function findTestcaseKeyInMarkdown(markdown) {
-  const m = markdown.match(CLUSTERFUZZ_TESTCASE_RE);
-  return m ? m[1] : null;
+  return findTestcaseKeysInMarkdown(markdown)[0] ?? null;
 }
 
 async function downloadAttachments(session, attachments, dir) {
@@ -289,7 +313,19 @@ async function issuesCmd(session, inputs, args, colorEnabled) {
 }
 
 async function cfCmd(session, inputs, args, colorEnabled) {
+  inputs = readCfInputs(inputs, args);
   if (inputs.length === 0) { usage(); process.exit(1); }
+  if (args.download) {
+    const results = await downloadTestcases(session, inputs, args);
+    if (args.format === 'json') console.log(JSON.stringify(sanitizeDeep(results), null, 2));
+    else for (const r of results) {
+      console.log(sanitizeTerminalText(r.ok
+        ? `${r.path} (${r.bytes} bytes)`
+        : `Failed ${r.input || r.key} ${r.variant || ''}: ${r.error}`));
+    }
+    if (results.some((r) => !r.ok)) process.exitCode = 1;
+    return;
+  }
   const keys = [];
   for (const input of inputs) {
     const target = resolveCfTarget(input);

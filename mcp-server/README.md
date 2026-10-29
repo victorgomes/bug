@@ -16,21 +16,20 @@ bnz login        # issuetracker.google.com
 bnz cf login     # clusterfuzz.com
 ```
 
-Then register the server with Claude Code. The simplest path is the
-`claude mcp add` command:
+Install the package as described in the top-level README, then register the
+global `bnz-mcp` executable with Claude Code:
 
 ```sh
-claude mcp add bnz -- node /home/jakob/src/buganizer_and_clusterfuzz/mcp-server/server.js
+claude mcp add bnz -- bnz-mcp
 ```
 
-…or add it to `~/.claude/mcp.json` (or `.mcp.json` in a repo) by hand:
+Or add it to `~/.claude/mcp.json` (or `.mcp.json` in a repo) by hand:
 
 ```json
 {
   "mcpServers": {
     "bnz": {
-      "command": "node",
-      "args": ["/home/jakob/src/buganizer_and_clusterfuzz/mcp-server/server.js"]
+      "command": "bnz-mcp"
     }
   }
 }

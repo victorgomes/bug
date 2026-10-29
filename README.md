@@ -17,15 +17,40 @@ attachment download URLs, reproducer endpoints).
 
 ## Install
 
+Create a packaged global installation rather than linking the checkout:
+
 ```sh
 git clone <this repo> ~/repos/bnz
 cd ~/repos/bnz
-npm install
-npx playwright install chromium
+./install.sh
 ```
 
-Add `~/repos/bnz` to your `PATH` so `bnz` is on it (the repo ships a `bnz`
-symlink to `bnz.js`).
+Run the script as your normal user; it invokes `sudo` for the global npm
+installation. It packs the checkout into a temporary directory, installs the
+archive and its dependencies globally, installs Chromium using that installed
+Playwright version, and removes the archive afterward. Chromium is downloaded
+as your normal user so `bnz` finds it in your browser cache.
+The script works from any working directory.
+
+This installs both `bnz` and `bnz-mcp` on the system `PATH`. Installing the
+checkout itself with `npm install --global .` creates a symlink back into the
+checkout. That is convenient for development, but it is not a self-contained
+tool installation and sandbox launchers may refuse to mount it. Installing the
+tarball copies only the package's declared files into npm's global tool tree.
+
+To update an existing installation after changing the source, rerun
+`./install.sh`. The install
+replaces the previous package while keeping bnz's profile and cache under
+`~/.config/bnz` untouched.
+
+For development and tests, use the checkout directly without installing it:
+
+```sh
+npm ci
+npm test
+./bnz.js --help
+node ./mcp-server/server.js
+```
 
 ## First-time login
 
@@ -63,16 +88,60 @@ bnz cf 5009280990216192         # by testcase key
 bnz cf 505610970                # by Buganizer issue id (resolves the testcase link)
 bnz cf b/505610970
 bnz cf https://clusterfuzz.com/testcase?key=5009280990216192
+bnz cf https://clusterfuzz.com/testcase-detail/6005188368302080
 bnz cf 505610970 --download-original   # also fetch the unminimized reproducer
 ```
 
 Numeric input is disambiguated by length: 14+ digits is treated as a testcase
 key; otherwise it's a Buganizer issue id and the issue's markdown is scanned
-for a `clusterfuzz.com/testcase?key=...` link.
+for a ClusterFuzz testcase or download link, including `testcase-detail/<id>`.
 
 The output is the full testcase page as markdown plus appendix sections for
 the minimized reproducer (always) and the original reproducer (when
 `--download-original` is set).
+
+### Save ClusterFuzz testcase files
+
+```sh
+bnz cf https://clusterfuzz.com/testcase-detail/6005188368302080 --download
+bnz cf 505610970 506855825 --download=/tmp/testcases --variant=both
+bnz cf 569549307, 569314507, 569018757, 568915773, 569089596 --download=cases --variant=both
+bnz cf --download=cases --variant=both <<< '569549307, 569314507, 569018757, 568915773, 569089596'
+bnz cf --ids-file=bugs.txt --download=/tmp/originals --variant=original
+cat bugs.txt | bnz cf - --download=/tmp/testcases --format=json
+```
+
+`--download[=DIR]` saves files and prints their paths and byte counts, without
+dumping testcase pages or contents. It defaults to the minimized testcase;
+`--variant=original` selects the unminimized file and `--variant=both` selects
+both. `--download-original` combined with `--download` also selects both.
+ClusterFuzz's default download endpoint can return the original when no
+minimized file exists.
+
+`--ids-file=FILE` accepts whitespace- or comma-separated bug IDs, `b/<id>`
+shorthand, testcase keys, or URLs. Use `--ids-file=-` or a positional `-` for
+stdin. File targets can be combined with positional targets. JSON output is
+an array with an `ok` status, source `inputs`, testcase `key`, `variant`,
+download `url`, and either `path`/`bytes` or `error` for each file. Resolution
+failures instead contain the failing `input` and `error`.
+
+Positional targets also accept comma-separated lists, whether passed as one
+quoted argument or several shell arguments. With no positional targets or
+`--ids-file`, redirected stdin is read automatically, including shell here
+strings (`<<<`). Each bug ID is resolved to the testcase links in its issue.
+
+The download path resolves each distinct issue once and collects all testcase
+links in it. It downloads each testcase variant once even when several bugs
+or URL forms reference it. One browser session handles the whole batch;
+`--jobs=N` bounds concurrent file requests (default 4, maximum 16). Minimized
+downloads go straight to the download endpoint. Original downloads read the
+page's structured blob references, cached for five minutes.
+
+Files are organized as `DIR/<cf-id>/<variant>/<server-filename>`, so their
+folders always identify the ClusterFuzz ID, even if the server returns a
+generic filename. Server filenames, extensions, and bytes are preserved.
+Existing files are never overwritten. A failed input or download
+does not stop the rest of the batch; any failure gives exit status 1.
 
 ### Download attachments
 
@@ -105,6 +174,10 @@ form is suitable for piping into `xargs bug` for batch fetches.
 | `--refresh`                   | Bypass the cache for this fetch (writes back as usual).         |
 | `--no-cache`                  | Disable cache reads and writes entirely.                        |
 | `--download-original`         | cf: also fetch the unminimized reproducer.                      |
+| `--download[=DIR]`             | cf: save testcase files instead of printing their contents.    |
+| `--variant=minimized\|original\|both` | cf downloads: select testcase variants.                  |
+| `--ids-file=FILE`              | cf: read target IDs/URLs from a file (`-` for stdin).           |
+| `--jobs=N`                     | cf downloads: concurrent file requests (default 4, max 16).   |
 | `--download-attachments[=DIR]`| Download every attachment URL the page exposes.                 |
 | `--debug`                     | Add `rawHtml` to JSON output.                                   |
 | `--no-color`                  | Disable ANSI color (also respects `NO_COLOR`).                  |
@@ -167,5 +240,6 @@ A single invocation can fetch multiple targets in one Chromium session —
 - `lib/browser.js` — Playwright session helpers + Turndown wiring.
 - `lib/dom.js` — In-page flat-tree HTML serializer (shadow + slot projection).
 - `lib/cache.js` — Disk cache.
+- `lib/cf-download.js` - Batch testcase resolution and binary downloads.
 - `lib/render.js` — Terminal sanitization, ANSI colors, header/appendix glue.
 - `test/` — Unit tests (URL resolution, parsing, sanitization, cache key).
