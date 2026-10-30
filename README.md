@@ -65,6 +65,18 @@ bnz cf login     # log into clusterfuzz.com
 Both services use Google SSO, so logging into one usually carries the other —
 but running both is harmless and ensures cookies are warm.
 
+To authenticate a headless remote workstation where hardware security keys are
+unavailable, push your local session directly over SSH (assumes `bnz` is
+installed on both machines):
+
+```sh
+bnz login --export=corp        # logs in locally if needed, then imports on `corp` via ssh
+bnz cf login --export=corp     # same for clusterfuzz.com
+```
+
+You can also pipe or save session JSON manually with `bnz login --export` and
+`bnz login --import[=FILE]`.
+
 ## Usage
 
 ### Fetch a Buganizer issue

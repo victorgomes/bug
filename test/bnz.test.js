@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
   extractSearchHits, extractSearchRows, findTestcaseKeyInMarkdown,
   parseArgs, parseSince, sanitizeFilename,
 } from '../bnz.js';
+import {
+  exportSessionState, importSessionState, pushSessionOverSsh,
+} from '../lib/browser.js';
 import { sanitizeDeep, sanitizeTerminalText } from '../lib/render.js';
 
 test('parseArgs picks up flags and positional targets', () => {
@@ -103,4 +109,90 @@ test('parseSince accepts durations and ISO dates', () => {
 test('sanitizeDeep recurses', () => {
   const dirty = { a: 'foo\x1b[31mbar', b: [{ c: 'baz\x07' }] };
   assert.deepEqual(sanitizeDeep(dirty), { a: 'foobar', b: [{ c: 'baz' }] });
+});
+
+test('parseArgs handles login --export and --import flags and errors', () => {
+  assert.equal(parseArgs(['login', '--export']).export, '-');
+  assert.equal(parseArgs(['login', '--export=corp']).export, 'corp');
+  assert.equal(parseArgs(['cf', 'login', '--export=user@corp']).export, 'user@corp');
+  assert.equal(parseArgs(['login', '--import']).import, '-');
+  assert.equal(parseArgs(['login', '--import=/tmp/s.json']).import, '/tmp/s.json');
+
+  assert.throws(() => parseArgs(['login', '--export=']), /Expected an SSH host/);
+  assert.throws(() => parseArgs(['login', '--export=-oProxyCommand=evil']), /Invalid SSH host/);
+  assert.throws(() => parseArgs(['login', '--export=bad host']), /Invalid SSH host/);
+  assert.throws(() => parseArgs(['login', '--import=']), /Expected a file path/);
+  assert.throws(() => parseArgs(['login', '--export=corp', '--import']), /Cannot combine/);
+  assert.throws(() => parseArgs(['12345', '--export=corp']), /require login/);
+  assert.throws(() => parseArgs(['login', 'corp']), /Unexpected argument to login/);
+});
+
+test('exportSessionState, importSessionState, and pushSessionOverSsh round-trip cookies', async () => {
+  const srcDir = mkdtempSync(join(tmpdir(), 'bnz-test-src-'));
+  const dstDir = mkdtempSync(join(tmpdir(), 'bnz-test-dst-'));
+  const fakeSsh = join(srcDir, 'fake-ssh.mjs');
+  try {
+    const expires = Math.floor(Date.now() / 1000) + 86400;
+    await importSessionState({
+      cookies: [
+        {
+          name: '__Secure-1PSID',
+          value: 'tok_new',
+          domain: '.google.com',
+          path: '/',
+          expires,
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+        },
+        {
+          name: '__Host-GAPS',
+          value: 'gaps_val',
+          domain: 'accounts.google.com',
+          path: '/',
+          expires,
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+        },
+      ],
+    }, { profileDir: srcDir });
+
+    const exported = await exportSessionState({ profileDir: srcDir });
+    assert.equal(exported.cookies.length, 2);
+
+    // Seed dstDir with a stale cookie first to verify import replaces it cleanly.
+    await importSessionState({
+      cookies: [{
+        name: 'STALE',
+        value: 'old',
+        domain: '.google.com',
+        path: '/',
+        expires,
+        secure: true,
+        sameSite: 'Lax',
+      }],
+    }, { profileDir: dstDir });
+
+    // Simulate ssh piping stdin into remote importSessionState on dstDir.
+    writeFileSync(fakeSsh, `#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { importSessionState } from ${JSON.stringify(new URL('../lib/browser.js', import.meta.url).href)};
+const args = process.argv.slice(2);
+if (args[0] !== '--' || args[1] !== 'corp') process.exit(2);
+const raw = readFileSync(0, 'utf8');
+await importSessionState(raw, { profileDir: ${JSON.stringify(dstDir)} });
+`, { mode: 0o755 });
+
+    await pushSessionOverSsh('corp', exported, { sshBin: fakeSsh });
+
+    const imported = await exportSessionState({ profileDir: dstDir });
+    assert.deepEqual(
+      imported.cookies.map((c) => `${c.name}=${c.value}`).sort(),
+      ['__Host-GAPS=gaps_val', '__Secure-1PSID=tok_new'],
+    );
+  } finally {
+    rmSync(srcDir, { recursive: true, force: true });
+    rmSync(dstDir, { recursive: true, force: true });
+  }
 });

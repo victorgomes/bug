@@ -7,12 +7,13 @@
 // beyond what's needed to act (extracting testcase links, command-line flags,
 // attachment URLs, reproducer download endpoints).
 
-import { realpathSync, mkdirSync, writeFileSync } from 'node:fs';
+import { realpathSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  AuthRequiredError, openSession, loginInteractive,
+  AuthRequiredError, exportSessionState, importSessionState,
+  loginInteractive, openSession, pushSessionOverSsh,
 } from './lib/browser.js';
 import {
   extractSearchHits, extractSearchRows, fetchIssue, fetchTestcase,
@@ -35,6 +36,8 @@ function usage() {
 
 Usage:
   bnz login                              Interactive Google SSO for issuetracker (one-time).
+  bnz login --export[=SSH_HOST]          Export session cookies to SSH_HOST (or stdout).
+  bnz login --import[=FILE]              Import session cookies from stdin (or FILE).
   bnz cf login                           Interactive Google SSO for clusterfuzz (one-time).
 
   bnz <id|url> [<id|url>...]             Fetch one or more issues.
@@ -65,6 +68,9 @@ Flags:
   --refresh                              Bypass the cache for this fetch (still writes back).
   --no-cache                             Disable cache reads and writes.
   --debug                                Include raw HTML in json output.
+  --export[=SSH_HOST]                    login: push local session cookies to SSH_HOST via ssh
+                                         (or print JSON to stdout if SSH_HOST is omitted).
+  --import[=FILE]                        login: import session JSON from stdin (or FILE).
   --no-color                             Disable ANSI color (also honors NO_COLOR).
   -h, --help                             Show this help.
 
@@ -101,6 +107,10 @@ function parseArgs(argv) {
     else if (a.startsWith('--download-attachments=')) {
       args.downloadAttachments = a.slice('--download-attachments='.length);
     }
+    else if (a === '--export') args.export = '-';
+    else if (a.startsWith('--export=')) args.export = a.slice('--export='.length);
+    else if (a === '--import') args.import = '-';
+    else if (a.startsWith('--import=')) args.import = a.slice('--import='.length);
     else if (a.startsWith('--format=')) args.format = a.slice('--format='.length);
     else if (a.startsWith('--since=')) args.since = a.slice('--since='.length);
     else if (a.startsWith('--max-pages=')) args.maxPages = parseInt(a.slice('--max-pages='.length), 10);
@@ -119,6 +129,22 @@ function parseArgs(argv) {
   if (args.download === '' || args.idsFile === '') throw new Error('Expected a nonempty path');
   if ((args.download || args.idsFile || args._.includes('-')) && args._[0] !== 'cf') {
     throw new Error('--download, --ids-file and stdin targets require cf');
+  }
+  if (args.export === '') throw new Error('Expected an SSH host after --export=');
+  if (args.export && args.export !== '-' && (args.export.startsWith('-') || /\s/.test(args.export))) {
+    throw new Error(`Invalid SSH host for --export: ${args.export}`);
+  }
+  if (args.import === '') throw new Error('Expected a file path after --import=');
+  if (args.export && args.import) throw new Error('Cannot combine --export and --import');
+  if (!args.help) {
+    const isLogin = args._[0] === 'login' || (args._[0] === 'cf' && args._[1] === 'login');
+    if ((args.export || args.import) && !isLogin) {
+      throw new Error('--export and --import require login');
+    }
+    if (isLogin) {
+      const rest = args._[0] === 'cf' ? args._.slice(2) : args._.slice(1);
+      if (rest.length) throw new Error(`Unexpected argument to login: ${rest[0]}`);
+    }
   }
   return args;
 }
@@ -378,6 +404,28 @@ function emit(results, args, colorEnabled, mdFn) {
   console.log(results.map(mdFn).join(MARKDOWN_SEPARATOR));
 }
 
+async function loginCmd(startUrl, args) {
+  if (args.import) {
+    const raw = args.import === '-'
+      ? readFileSync(0, 'utf8')
+      : readFileSync(args.import, 'utf8');
+    const { count, profileDir } = await importSessionState(raw);
+    console.error(`Imported ${count} cookies into ${profileDir}`);
+    return;
+  }
+  if (args.export) {
+    const state = await exportSessionState({ startUrl });
+    if (args.export === '-') {
+      process.stdout.write(JSON.stringify(state) + '\n');
+    } else {
+      console.error(`Exporting ${state.cookies.length} cookies to ${args.export} ...`);
+      await pushSessionOverSsh(args.export, state);
+    }
+    return;
+  }
+  await loginInteractive(startUrl);
+}
+
 // ---------- main ----------
 
 async function main() {
@@ -392,11 +440,11 @@ async function main() {
   const cmd = args._[0];
 
   if (cmd === 'login') {
-    await loginInteractive('https://issuetracker.google.com/');
+    await loginCmd('https://issuetracker.google.com/', args);
     return;
   }
   if (cmd === 'cf' && args._[1] === 'login') {
-    await loginInteractive('https://clusterfuzz.com/');
+    await loginCmd('https://clusterfuzz.com/', args);
     return;
   }
 
