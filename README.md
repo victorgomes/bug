@@ -93,6 +93,91 @@ Output is the full page rendered as markdown, with a synthesized
 `# Issue <id>` header plus a final `## Attachments` section listing any
 attachment URLs found on the page.
 
+### Comment on an issue
+
+```sh
+bnz comment 505610970 "Landed fix in https://crrev.com/c/1234567"
+bnz comment 505610970 506855825 -m "Tracking under umbrella bug b/500000000."
+bnz comment b/505610970 -F notes.md
+cat analysis.md | bnz comment 505610970
+bnz comment 505610970 -m "Plain text body" --plain
+bnz comment 505610970 -m "Preview only" --dry-run
+```
+
+Comments are formatted as **Markdown** by default (`--plain` switches to plain
+text) and immediately invalidate the local issue cache so a follow-up `bnz <id>`
+fetches the updated thread.
+
+### Close an issue
+
+```sh
+bnz close 505610970                                  # Fixed (default)
+bnz close 505610970 -m "Fixed by https://crrev.com/c/1234567"
+bnz close 505610970 --verified -m "Verified on Canary"
+bnz close 505610970 --duplicate=506855825            # Duplicate of 506855825
+bnz close 505610970 duplicate of b/506855825 -m "Same root cause."
+bnz close 505610970 --wont-fix                       # Won't fix (Infeasible)
+bnz close 505610970 --wont-fix=wai -m "Spec-compliant behavior."
+bnz close 505610970 --norepro -m "No longer reproduces on ToT."
+bnz close 505610970 --obsolete
+bnz close 505610970 --inactive
+bnz close 505610970 --wont-fix=wai --dry-run         # Preview without mutating
+```
+
+Supported close resolutions (`-s` / `--status=<status>`, positional shorthand,
+or dedicated flags):
+
+| Resolution | `--status` / positional | Dedicated shorthand flags |
+|---|---|---|
+| Fixed *(default)* | `fixed` | `--fixed` |
+| Fixed (Verified) | `verified` | `--verified` |
+| Duplicate | `duplicate` + target | `--duplicate=<id\|url>`, `--duplicate-of=<id\|url>`, `--dup=<id\|url>` |
+| Won't fix (Infeasible) | `wontfix`, `infeasible` | `--wont-fix`, `--infeasible` |
+| Won't fix (Intended behavior) | `wai`, `intended-behavior` | `--wai`, `--intended-behavior`, `--wont-fix=wai` |
+| Won't fix (Not reproducible) | `norepro`, `not-reproducible` | `--norepro`, `--not-reproducible`, `--wont-fix=norepro` |
+| Won't fix (Obsolete) | `obsolete` | `--obsolete`, `--wont-fix=obsolete` |
+| Inactive | `inactive` | `--inactive` |
+
+Closing an unassigned (`New`) issue as `Fixed` or `Fixed (Verified)`
+automatically assigns it to your authenticated Buganizer account unless you
+override it with `--assignee=<email|me>`. For non-duplicate resolutions, the
+status change, assignee update, and closing comment (`-m` / `-F`) are submitted
+in a single atomic Buganizer update. Duplicate targets work even when the
+canonical issue is already closed, older than 365 days, or in another component.
+
+### Assign, edit fields, or inspect field schemas
+
+```sh
+# Inspect all standard + custom fields, current values, and allowed enum choices:
+bnz fields 579236924
+bnz fields 579236924 --full            # also show unpopulated hidden tracker fields
+
+# Assign or unassign:
+bnz assign 579236924 merges@chromium.org
+bnz assign 579236924 me -m "Taking a look."
+bnz unassign 579236924                 # or: bnz assign 579236924 none
+
+# Edit standard and custom fields (e.g. Chromium merge workflow):
+bnz edit 579236924 \
+  --add-code-change=https://chromium-review.googlesource.com/c/v8/v8/+/8691333 \
+  --os=Android,Linux,Mac,Windows \
+  -f "Safe Merge=Yes" \
+  --assignee=merges@chromium.org \
+  -m "Merge CL ready for review."
+
+# Append, remove, or clear repeated / scalar fields:
+bnz edit 579236924 --add-os=ChromeOS --remove-os=Fuchsia
+bnz edit 579236924 "OS+=iOS" "Merge-Request+=157" -p P1 --severity=S1
+bnz edit 579236924 --clear-field "Safe Merge" --dry-run
+```
+
+Notes on `bnz edit` (alias `bnz set`) and `bnz assign`:
+
+- **Assignee <-> Status invariants**: assigning a `New` bug automatically transitions `Status` to `Assigned`; unassigning (`none` or `bnz unassign`) an `Assigned` or `In Progress` bug transitions `Status` to `New`.
+- **`Code Changes`**: pass a full Gerrit URL including the repository path (e.g. `https://chromium-review.googlesource.com/c/v8/v8/+/8691333`) or a numeric Critique CL ID. Buganizer rejects shortened `crrev.com/c/<cl>` links in `Code Changes`.
+- **Custom fields (`OS`, `Safe Merge`, `Merge-Request`, `Found In`, etc.)**: match case-insensitively by field name or numeric `customFieldId`. Enum choices are validated against the issue's component schema before sending any write RPC.
+- **Atomic updates & dry-run**: all field updates and `-m` / `-F` comments execute in a single `ModifyIssue` RPC; `-n` / `--dry-run` validates every field and prints exact `before -> after` diffs without mutating Buganizer.
+
 ### Fetch a ClusterFuzz testcase
 
 ```sh
@@ -169,13 +254,17 @@ output listing the resulting filenames and sizes.
 ### Search
 
 ```sh
-bug list "reporter:me status:open"
-bug list "assignee:me modified>now-7d"
-bug list "componentid:1456355 status:open" --format=json
+bnz list                                           # defaults to "assignee:me status:open"
+bnz list --slo                                     # my open bugs grouped & sorted by Chromium SLO
+bnz list "reporter:me status:open"
+bnz list "assignee:me modified>now-7d"
+bnz list "componentid:1456355 status:open" --format=json
 ```
 
-Runs a Buganizer search and emits the matching issues. The `--format=json`
-form is suitable for piping into `xargs bug` for batch fetches.
+Runs a Buganizer search and emits the matching issues. Passing `--slo` groups
+and sorts results into Out of SLO, Due Within 7 Days, In SLO, and Out of SLO
+Scope using Chromium's priority/severity/merge SLO rules. The `--format=json`
+form is suitable for piping into `xargs bnz` for batch fetches.
 
 ### Common flags
 
@@ -191,6 +280,17 @@ form is suitable for piping into `xargs bug` for batch fetches.
 | `--ids-file=FILE`              | cf: read target IDs/URLs from a file (`-` for stdin).           |
 | `--jobs=N`                     | cf downloads: concurrent file requests (default 4, max 16).   |
 | `--download-attachments[=DIR]`| Download every attachment URL the page exposes.                 |
+| `-m`, `--message=<text>`      | comment / close / assign / edit: comment text (`--comment`).    |
+| `-F`, `--file=<path>`         | comment / close / assign / edit: read comment from file (`-` for stdin). |
+| `--plain`                     | comment / close / assign / edit: send plain text instead of Markdown. |
+| `-s`, `--status=<status>`     | close / edit: status (`new`, `assigned`, `in-progress`, `fixed`, `wontfix`, ...). |
+| `--duplicate=<id\|url>`       | close: mark as `Duplicate` of target issue.                     |
+| `--assignee=<email\|me\|none>`| assign / edit / close: set assignee (or `"none"` to unassign).  |
+| `--code-changes=<url\|cl,...>`| edit: replace `Code Changes` (or `--add-code-change`, `--remove-code-change`). |
+| `--os=<os,...>`               | edit: set `OS` custom field (or `--add-os`, `--remove-os`).     |
+| `-f`, `--field "<Name>=<Val>"`| edit: set any custom or standard field (`Name+=Val` / `Name-=Val` / `--clear-field`). |
+| `-n`, `--dry-run`             | comment / close / assign / edit: verify access and preview diffs without mutating. |
+| `--slo`                       | list: group and sort issues by Chromium SLO deadlines.          |
 | `--debug`                     | Add `rawHtml` to JSON output.                                   |
 | `--no-color`                  | Disable ANSI color (also respects `NO_COLOR`).                  |
 | `-h`, `--help`                | Show usage.                                                     |
@@ -251,6 +351,8 @@ A single invocation can fetch multiple targets in one Chromium session —
 - `lib/url.js` — URL normalization (issue, testcase, search, attachment).
 - `lib/browser.js` — Playwright session helpers + Turndown wiring.
 - `lib/dom.js` — In-page flat-tree HTML serializer (shadow + slot projection).
+- `lib/fetch.js` — Buganizer/ClusterFuzz page fetchers, search parser, and SLO rules.
+- `lib/mutate.js` — Authenticated Buganizer comment and close RPCs + cache invalidation.
 - `lib/cache.js` — Disk cache.
 - `lib/cf-download.js` - Batch testcase resolution and binary downloads.
 - `lib/render.js` — Terminal sanitization, ANSI colors, header/appendix glue.

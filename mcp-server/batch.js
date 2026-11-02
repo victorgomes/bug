@@ -16,8 +16,8 @@ import { sanitizeDeep } from '../lib/render.js';
 
 export const MARKDOWN_SEPARATOR = '\n\n---\n\n';
 
-export function renderItemError(item, err) {
-  return `# Error fetching \`${item}\`\n\n${err}\n`;
+export function renderItemError(item, err, verb = 'fetching') {
+  return `# Error ${verb} \`${item}\`\n\n${err}\n`;
 }
 
 export async function batchFetch({ items, fetchOne }) {
@@ -33,7 +33,7 @@ export async function batchFetch({ items, fetchOne }) {
   return entries;
 }
 
-export function formatEntries({ entries, render, format }) {
+export function formatEntries({ entries, render, format, errorVerb = 'fetching' }) {
   if (format === 'json') {
     return JSON.stringify(
       sanitizeDeep(entries.map((e) =>
@@ -42,7 +42,7 @@ export function formatEntries({ entries, render, format }) {
     );
   }
   return entries
-    .map((e) => e.ok ? render(e.data) : renderItemError(e.item, e.error))
+    .map((e) => e.ok ? render(e.data) : renderItemError(e.item, e.error, errorVerb))
     .join(MARKDOWN_SEPARATOR);
 }
 

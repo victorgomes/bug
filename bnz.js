@@ -16,9 +16,14 @@ import {
   loginInteractive, openSession, pushSessionOverSsh,
 } from './lib/browser.js';
 import {
-  extractSearchHits, extractSearchRows, fetchIssue, fetchTestcase,
-  parseSince, searchIssues,
+  DEFAULT_LIST_QUERY, computeIssueSlo, extractSearchHits, extractSearchRows,
+  fetchIssue, fetchTestcase, parseSince, searchIssues, sortHitsBySlo,
 } from './lib/fetch.js';
+import {
+  assignIssue, closeIssue, commentIssue, editIssue, fetchIssueFields,
+  normalizeStatusToken, parseCodeChangeEntry, resolveCloseStatus,
+  resolveIssueStatus, resolveIssueType, resolvePriority, resolveSeverity,
+} from './lib/mutate.js';
 import {
   resolveCfTarget, resolveIssueUrl,
 } from './lib/url.js';
@@ -41,10 +46,63 @@ Usage:
   bnz cf login                           Interactive Google SSO for clusterfuzz (one-time).
 
   bnz <id|url> [<id|url>...]             Fetch one or more issues.
+  bnz fields <id|url> [...] [--full]     List standard and custom fields + allowed values.
+  bnz assign <id|url> [...] <email|me|none>  Assign (or unassign with "none") one or more issues.
+  bnz unassign <id|url> [...]            Clear assignee on one or more issues.
+  bnz edit <id|url> [...] [options]      Update standard or custom fields (alias: bnz set).
+  bnz comment <id|url> "<text>"          Post a comment on an issue (Markdown by default).
+  bnz comment <id|url> [...] -m "<text>" Post a comment on one or more issues (or -F <file>).
+  bnz close <id|url> [...] [options]     Close one or more issues (default status: Fixed).
   bnz cf <key|url|issue-id> [...]        Fetch one or more clusterfuzz testcases.
                                          (Numeric input: 14+ digits = testcase key.)
                                          IDs may be comma-separated, quoted or unquoted.
-  bnz list "<query>"                     Search issuetracker (raw Buganizer query syntax).
+  bnz list ["<query>"]                   Search issuetracker (default: "assignee:me status:open").
+
+Edit & field options (for \`bnz edit\` / \`bnz assign\`):
+  --assignee=<email|me|none>             Set assignee, or pass "none" (or --unassign) to clear.
+  -p, --priority=<P0..P4>                Set priority (P0, P1, P2, P3, P4).
+  --severity=<S0..S4>                    Set severity (S0, S1, S2, S3, S4).
+  -s, --status=<status>                  Set status (new, assigned, in-progress, or close status).
+  --type=<type>                          Set issue type (bug, vulnerability, feature-request, task, ...).
+  --title=<text>                         Set issue title.
+  --component=<id>                       Move issue to numeric component ID.
+  --verifier=<email|me|none>             Set or clear verifier.
+  --code-changes=<url|cl,...>            Replace Code Changes (full Gerrit /c/<repo>/+/<cl> URL or CL).
+  --add-code-change=<url|cl,...>         Append to Code Changes without removing existing entries.
+  --remove-code-change=<url|cl,...>      Remove entry from Code Changes.
+  --os=<os,...> | --add-os | --remove-os Set, append, or remove values on the OS custom field.
+  --cc=<emails> | --add-cc | --remove-cc Replace, add, or remove CC emails ("me" supported).
+  --collaborators=<emails> | --add-collaborator | --remove-collaborator
+  -f, --field "<Name>=<Value>"           Set any custom or standard field (repeatable; also supports
+                                         "Name+=Val" to append and "Name-=Val" to remove).
+  --add-field "<Name>=<Value>"           Append value(s) to a repeated custom or standard field.
+  --remove-field "<Name>=<Value>"        Remove value(s) from a repeated custom or standard field.
+  --clear-field "<Name>"                 Clear a custom or standard field.
+
+Close options (for \`bnz close\`):
+  -s, --status=<status>                  Close resolution (default: fixed):
+                                           fixed              Fixed
+                                           verified           Fixed (Verified)
+                                           duplicate          Duplicate (requires --duplicate-of)
+                                           wontfix|infeasible Won't fix (Infeasible)
+                                           wai|intended-behavior  Won't fix (Intended behavior)
+                                           norepro|not-reproducible  Won't fix (Not reproducible)
+                                           obsolete           Won't fix (Obsolete)
+                                           inactive           Inactive
+  --fixed | --verified | --inactive      Shorthands for --status=...
+  --wont-fix[=<reason>]                  Won't fix (default: infeasible; or wai, norepro, obsolete).
+  --wai | --intended-behavior            Shorthand for Won't fix (Intended behavior).
+  --norepro | --not-reproducible         Shorthand for Won't fix (Not reproducible).
+  --obsolete | --infeasible              Shorthands for Won't fix (Obsolete / Infeasible).
+  --duplicate=<id|url>                   Mark as Duplicate of target issue (alias: --duplicate-of).
+  --assignee=<email|me>                  Set assignee when closing (auto-assigns to you if unassigned
+                                         and closing as Fixed or Verified).
+
+Comment & mutation flags (for \`bnz comment\`, \`bnz close\`, \`bnz assign\`, \`bnz edit\`):
+  -m, --message=<text>                   Comment text (alias: --comment=<text>).
+  -F, --file=<path>                      Read comment text from file (- for stdin).
+  --plain                                Post comment as plain text instead of Markdown.
+  -n, --dry-run                          Verify access and preview changes without mutating Buganizer.
 
 Flags:
   --format=markdown|json                 Output format. markdown is the default; json emits a
@@ -62,6 +120,7 @@ Flags:
   --full                                 Skip the chrome filter — dump the entire page, including
                                          top bar, side nav, FABs, and interactive buttons. By
                                          default the output is the issue body only.
+  --slo                                  list: group and sort issues by Chromium SLO deadlines.
   --since=<dur>                          list: keep only hits modified since the duration ago.
                                          e.g. --since=7d, --since=1w, --since=2026-05-01.
   --max-pages=N                          list: cap pagination at N pages of 50 hits (default 30).
@@ -79,6 +138,26 @@ Cache:
 `);
 }
 
+function parseFieldSpec(raw, forcedOp = null) {
+  const s = String(raw ?? '');
+  const eqIdx = s.indexOf('=');
+  if (eqIdx <= 0) {
+    throw new Error(`Expected "<Field>=<Value>" (got "${s}")`);
+  }
+  let op = forcedOp || 'set';
+  let namePart = s.slice(0, eqIdx);
+  if (!forcedOp && eqIdx > 1 && s[eqIdx - 1] === '+') {
+    op = 'add';
+    namePart = s.slice(0, eqIdx - 1);
+  } else if (!forcedOp && eqIdx > 1 && s[eqIdx - 1] === '-') {
+    op = 'remove';
+    namePart = s.slice(0, eqIdx - 1);
+  }
+  const name = namePart.trim();
+  if (!name) throw new Error(`Expected non-empty field name before "=" in "${s}"`);
+  return { name, op, value: s.slice(eqIdx + 1) };
+}
+
 function parseArgs(argv) {
   const args = {
     _: [],
@@ -89,8 +168,72 @@ function parseArgs(argv) {
     downloadAttachments: null,
     download: null,
     jobs: 4,
+    status: null,
+    statusFromShorthand: false,
+    duplicateOf: null,
+    assignee: null,
+    priority: null,
+    severity: null,
+    type: null,
+    title: null,
+    componentId: null,
+    verifier: null,
+    cc: undefined,
+    addCc: [],
+    removeCc: [],
+    collaborators: undefined,
+    addCollaborators: [],
+    removeCollaborators: [],
+    codeChanges: undefined,
+    addCodeChanges: [],
+    removeCodeChanges: [],
+    fieldOps: [],
+    comment: null,
+    commentFile: null,
+    markdown: true,
+    dryRun: false,
   };
-  for (const a of argv) {
+
+  const setCloseStatus = (val, fromShorthand = false) => {
+    if (!val) throw new Error('Expected a non-empty status');
+    if (args.status && normalizeStatusToken(args.status) !== normalizeStatusToken(val)) {
+      throw new Error(`Conflicting statuses: "${args.status}" and "${val}"`);
+    }
+    args.status = val;
+    if (fromShorthand) args.statusFromShorthand = true;
+  };
+  const setComment = (val) => {
+    if (args.comment !== null) throw new Error('Multiple -m/--message/--comment flags passed');
+    args.comment = val;
+  };
+  const setCommentFile = (val) => {
+    if (!val) throw new Error('Expected a file path after -F/--file');
+    if (args.commentFile !== null) throw new Error('Multiple -F/--file flags passed');
+    args.commentFile = val;
+  };
+  const setDuplicateOf = (val, flag) => {
+    if (!val || val.startsWith('-')) {
+      throw new Error(`Expected a target issue id or URL after ${flag}`);
+    }
+    if (args.duplicateOf && args.duplicateOf !== val) {
+      throw new Error(`Conflicting duplicate targets: "${args.duplicateOf}" and "${val}"`);
+    }
+    args.duplicateOf = val;
+  };
+  const takeVal = (iRef, flag) => {
+    const eq = flag.indexOf('=');
+    if (eq !== -1) return flag.slice(eq + 1);
+    if (iRef.i + 1 >= argv.length) throw new Error(`Expected a value after ${flag}`);
+    return argv[++iRef.i];
+  };
+
+  const iRef = { i: 0 };
+  for (; iRef.i < argv.length; iRef.i++) {
+    const a = argv[iRef.i];
+    if (a === '--') {
+      args._.push(...argv.slice(iRef.i + 1));
+      break;
+    }
     if (a === '--help' || a === '-h') args.help = true;
     else if (a === '--no-color') args.noColor = true;
     else if (a === '--debug') args.debug = true;
@@ -112,8 +255,128 @@ function parseArgs(argv) {
     else if (a === '--import') args.import = '-';
     else if (a.startsWith('--import=')) args.import = a.slice('--import='.length);
     else if (a.startsWith('--format=')) args.format = a.slice('--format='.length);
+    else if (a === '--slo') args.slo = true;
     else if (a.startsWith('--since=')) args.since = a.slice('--since='.length);
     else if (a.startsWith('--max-pages=')) args.maxPages = parseInt(a.slice('--max-pages='.length), 10);
+    else if (a === '--plain') args.markdown = false;
+    else if (a === '--dry-run' || a === '-n') args.dryRun = true;
+    else if (a === '-m' || a === '--message' || a === '--comment' ||
+             a.startsWith('-m=') || a.startsWith('--message=') || a.startsWith('--comment=')) {
+      setComment(takeVal(iRef, a));
+    }
+    else if (a === '-F' || a === '--file' || a === '--comment-file' ||
+             a.startsWith('-F=') || a.startsWith('--file=') || a.startsWith('--comment-file=')) {
+      setCommentFile(takeVal(iRef, a));
+    }
+    else if (a === '-s' || a === '--status' || a.startsWith('-s=') || a.startsWith('--status=')) {
+      setCloseStatus(takeVal(iRef, a));
+    }
+    else if (a === '--fixed') setCloseStatus('fixed', true);
+    else if (a === '--verified') setCloseStatus('verified', true);
+    else if (a === '--inactive') setCloseStatus('inactive', true);
+    else if (a === '--obsolete') setCloseStatus('obsolete', true);
+    else if (a === '--infeasible') setCloseStatus('infeasible', true);
+    else if (a === '--wai' || a === '--intended-behavior') setCloseStatus('intended-behavior', true);
+    else if (a === '--norepro' || a === '--not-reproducible' || a === '--cant-repro') {
+      setCloseStatus('not-reproducible', true);
+    }
+    else if (a === '--wont-fix' || a === '--wontfix') setCloseStatus('wontfix', true);
+    else if (a.startsWith('--wont-fix=')) {
+      const sub = a.slice('--wont-fix='.length);
+      if (!sub) throw new Error('Expected a reason after --wont-fix=');
+      setCloseStatus('wontfix:' + sub, true);
+    }
+    else if (a.startsWith('--wontfix=')) {
+      const sub = a.slice('--wontfix='.length);
+      if (!sub) throw new Error('Expected a reason after --wontfix=');
+      setCloseStatus('wontfix:' + sub, true);
+    }
+    else if (a === '--duplicate' || a === '--duplicate-of' || a === '--dup' ||
+             a.startsWith('--duplicate=') || a.startsWith('--duplicate-of=') || a.startsWith('--dup=')) {
+      setDuplicateOf(takeVal(iRef, a), a.split('=')[0]);
+    }
+    else if (a === '--assignee' || a.startsWith('--assignee=')) {
+      const val = takeVal(iRef, a);
+      if (!val) throw new Error('Expected an email, "me", or "none" after --assignee');
+      args.assignee = val;
+    }
+    else if (a === '--unassign') {
+      args.assignee = 'none';
+    }
+    else if (a === '-p' || a === '--priority' || a.startsWith('-p=') || a.startsWith('--priority=')) {
+      args.priority = takeVal(iRef, a);
+    }
+    else if (a === '--severity' || a.startsWith('--severity=')) {
+      args.severity = takeVal(iRef, a);
+    }
+    else if (a === '--type' || a.startsWith('--type=')) {
+      args.type = takeVal(iRef, a);
+    }
+    else if (a === '--title' || a.startsWith('--title=')) {
+      args.title = takeVal(iRef, a);
+    }
+    else if (a === '--component' || a === '--component-id' ||
+             a.startsWith('--component=') || a.startsWith('--component-id=')) {
+      args.componentId = takeVal(iRef, a);
+    }
+    else if (a === '--verifier' || a.startsWith('--verifier=')) {
+      args.verifier = takeVal(iRef, a);
+    }
+    else if (a === '--cc' || a.startsWith('--cc=')) {
+      args.cc = takeVal(iRef, a);
+    }
+    else if (a === '--add-cc' || a.startsWith('--add-cc=')) {
+      args.addCc.push(takeVal(iRef, a));
+    }
+    else if (a === '--remove-cc' || a.startsWith('--remove-cc=')) {
+      args.removeCc.push(takeVal(iRef, a));
+    }
+    else if (a === '--collaborators' || a.startsWith('--collaborators=')) {
+      args.collaborators = takeVal(iRef, a);
+    }
+    else if (a === '--add-collaborator' || a === '--add-collaborators' ||
+             a.startsWith('--add-collaborator=') || a.startsWith('--add-collaborators=')) {
+      args.addCollaborators.push(takeVal(iRef, a));
+    }
+    else if (a === '--remove-collaborator' || a === '--remove-collaborators' ||
+             a.startsWith('--remove-collaborator=') || a.startsWith('--remove-collaborators=')) {
+      args.removeCollaborators.push(takeVal(iRef, a));
+    }
+    else if (a === '--code-changes' || a === '--code-change' ||
+             a.startsWith('--code-changes=') || a.startsWith('--code-change=')) {
+      args.codeChanges = takeVal(iRef, a);
+    }
+    else if (a === '--add-code-change' || a === '--add-code-changes' ||
+             a.startsWith('--add-code-change=') || a.startsWith('--add-code-changes=')) {
+      args.addCodeChanges.push(takeVal(iRef, a));
+    }
+    else if (a === '--remove-code-change' || a === '--remove-code-changes' ||
+             a.startsWith('--remove-code-change=') || a.startsWith('--remove-code-changes=')) {
+      args.removeCodeChanges.push(takeVal(iRef, a));
+    }
+    else if (a === '--os' || a.startsWith('--os=')) {
+      args.fieldOps.push({ name: 'OS', op: 'set', value: takeVal(iRef, a) });
+    }
+    else if (a === '--add-os' || a.startsWith('--add-os=')) {
+      args.fieldOps.push({ name: 'OS', op: 'add', value: takeVal(iRef, a) });
+    }
+    else if (a === '--remove-os' || a.startsWith('--remove-os=')) {
+      args.fieldOps.push({ name: 'OS', op: 'remove', value: takeVal(iRef, a) });
+    }
+    else if (a === '-f' || a === '--field' || a.startsWith('-f=') || a.startsWith('--field=')) {
+      args.fieldOps.push(parseFieldSpec(takeVal(iRef, a)));
+    }
+    else if (a === '--add-field' || a.startsWith('--add-field=')) {
+      args.fieldOps.push(parseFieldSpec(takeVal(iRef, a), 'add'));
+    }
+    else if (a === '--remove-field' || a.startsWith('--remove-field=')) {
+      args.fieldOps.push(parseFieldSpec(takeVal(iRef, a), 'remove'));
+    }
+    else if (a === '--clear-field' || a.startsWith('--clear-field=')) {
+      const name = takeVal(iRef, a).trim();
+      if (!name) throw new Error('Expected a field name after --clear-field');
+      args.fieldOps.push({ name, op: 'clear', value: null });
+    }
     else args._.push(a);
   }
   if (!['markdown', 'json'].includes(args.format)) {
@@ -136,13 +399,55 @@ function parseArgs(argv) {
   }
   if (args.import === '') throw new Error('Expected a file path after --import=');
   if (args.export && args.import) throw new Error('Cannot combine --export and --import');
+  if (args.comment !== null && args.commentFile !== null) {
+    throw new Error('Cannot combine -m/--message and -F/--file');
+  }
   if (!args.help) {
-    const isLogin = args._[0] === 'login' || (args._[0] === 'cf' && args._[1] === 'login');
+    const cmd = args._[0];
+    const isEdit = cmd === 'edit' || cmd === 'set';
+    const isAssign = cmd === 'assign' || cmd === 'unassign';
+    const isMutate = cmd === 'comment' || cmd === 'close' || isEdit || isAssign;
+    const hasEditOnlyFlags =
+      args.priority !== null ||
+      args.severity !== null ||
+      args.type !== null ||
+      args.title !== null ||
+      args.componentId !== null ||
+      args.verifier !== null ||
+      args.cc !== undefined || args.addCc.length > 0 || args.removeCc.length > 0 ||
+      args.collaborators !== undefined || args.addCollaborators.length > 0 || args.removeCollaborators.length > 0 ||
+      args.codeChanges !== undefined || args.addCodeChanges.length > 0 || args.removeCodeChanges.length > 0 ||
+      args.fieldOps.length > 0;
+
+    if (args.slo && cmd !== 'list') {
+      throw new Error('--slo requires list');
+    }
+    if (args.duplicateOf && cmd !== 'close') {
+      throw new Error('--duplicate requires `bnz close`');
+    }
+    if (args.status && cmd !== 'close' && !isEdit) {
+      throw new Error('Status flags require `bnz close` or `bnz edit`');
+    }
+    if (args.assignee !== null && cmd !== 'close' && !isEdit && !isAssign) {
+      throw new Error('--assignee and --unassign require `bnz assign`, `bnz edit`, or `bnz close`');
+    }
+    if (hasEditOnlyFlags && !isEdit) {
+      throw new Error('Field modification flags require `bnz edit` (e.g. `bnz edit <id> --os=... --code-changes=...`)');
+    }
+    if (
+      (args.comment !== null || args.commentFile !== null || !args.markdown || args.dryRun) &&
+      !isMutate
+    ) {
+      throw new Error(
+        'Comment, --plain, and --dry-run flags require `bnz comment`, `bnz close`, `bnz assign`, or `bnz edit`',
+      );
+    }
+    const isLogin = cmd === 'login' || (cmd === 'cf' && args._[1] === 'login');
     if ((args.export || args.import) && !isLogin) {
       throw new Error('--export and --import require login');
     }
     if (isLogin) {
-      const rest = args._[0] === 'cf' ? args._.slice(2) : args._.slice(1);
+      const rest = cmd === 'cf' ? args._.slice(2) : args._.slice(1);
       if (rest.length) throw new Error(`Unexpected argument to login: ${rest[0]}`);
     }
   }
@@ -275,9 +580,99 @@ function renderTestcaseMarkdown(tc, args, colorEnabled) {
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
 }
 
+function formatSloDue(dateStr, remDays, c, colorEnabled) {
+  if (!dateStr || remDays === null || remDays === undefined) return '—';
+  const label = `${dateStr} (${remDays}d)`;
+  if (remDays < 0) return colorEnabled ? c.red(label) : `**${label}**`;
+  if (remDays <= 3) return colorEnabled ? c.yellow(label) : `**${label}**`;
+  return label;
+}
+
+function renderSloTable(hits, c, colorEnabled) {
+  const lines = [
+    '| Issue | Pri/Sev | Rule | Closure Due | Update Due | Title |',
+    '| --- | --- | --- | --- | --- | --- |',
+  ];
+  for (const h of hits) {
+    const slo = h.slo || computeIssueSlo(h);
+    const priSev = [h.priority, h.severity].filter(Boolean).join('/') || '—';
+    const esc = (s) => String(s).replace(/\|/g, '\\|');
+    const cells = [
+      `[${esc(h.id)}](${h.url})`,
+      esc(priSev),
+      esc(slo.rule),
+      esc(formatSloDue(slo.closureDue, slo.closureRemDays, c, colorEnabled)),
+      esc(formatSloDue(slo.updateDue, slo.updateRemDays, c, colorEnabled)),
+      esc(h.title),
+    ];
+    lines.push(`| ${cells.join(' | ')} |`);
+  }
+  return lines;
+}
+
+function renderSloListMarkdown(data, c, colorEnabled) {
+  const out = [];
+  out.push(header(c, `Search (by SLO): ${data.query}`, data.searchUrl));
+  if (!data.hits.length) {
+    out.push(c.dim('(no results)'));
+    if (data.since && data.filteredOut) {
+      out.push(c.dim(`(${data.filteredOut} hits were filtered out by --since=${data.since})`));
+    }
+    return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+  }
+
+  const hits = data.hits.every((h) => h.slo) ? data.hits : sortHitsBySlo(data.hits);
+  const overdue = hits.filter((h) => h.slo.bucket === 'overdue');
+  const dueSoon = hits.filter((h) => h.slo.bucket === 'due_soon');
+  const inSlo = hits.filter((h) => h.slo.bucket === 'in_slo');
+  const outOfScope = hits.filter((h) => h.slo.bucket === 'none');
+
+  const summaryBits = [`${hits.length} result(s)`];
+  if (overdue.length) summaryBits.push(c.red(`${overdue.length} out of SLO`));
+  if (dueSoon.length) summaryBits.push(c.yellow(`${dueSoon.length} due <=7d`));
+  if (inSlo.length) summaryBits.push(c.green(`${inSlo.length} in SLO`));
+  if (outOfScope.length) summaryBits.push(c.dim(`${outOfScope.length} out of scope`));
+  if (data.pagesFetched > 1) summaryBits.push(`${data.pagesFetched} pages`);
+  if (data.since) summaryBits.push(`since ${data.since}, ${data.filteredOut} filtered out`);
+  out.push(summaryBits.join('  ·  '));
+
+  const sections = [
+    ['Out of SLO', overdue],
+    ['Due Within 7 Days', dueSoon],
+    ['In SLO', inSlo],
+  ];
+  for (const [title, group] of sections) {
+    if (!group.length) continue;
+    out.push('');
+    out.push(c.bold(`## ${title} (${group.length})`));
+    out.push('');
+    out.push(...renderSloTable(group, c, colorEnabled));
+  }
+
+  if (outOfScope.length) {
+    out.push('');
+    out.push(c.bold(`## Out of SLO Scope (${outOfScope.length})`));
+    out.push('');
+    const byPri = new Map();
+    for (const h of outOfScope) {
+      const k = h.priority || 'Other';
+      if (!byPri.has(k)) byPri.set(k, []);
+      byPri.get(k).push(h);
+    }
+    for (const [pri, group] of byPri) {
+      const links = group.map((h) => `[${h.id}](${h.url})`).join(', ');
+      out.push(`- **${pri}** (${group.length}): ${links}`);
+    }
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
 function renderListMarkdown(search, args, colorEnabled) {
   const c = makeColors(colorEnabled);
   const data = sanitizeDeep(search);
+  if (args?.slo || data.slo) {
+    return renderSloListMarkdown(data, c, colorEnabled);
+  }
   const out = [];
   out.push(header(c, `Search: ${data.query}`, data.searchUrl));
   if (!data.hits.length) {
@@ -319,7 +714,616 @@ function renderListMarkdown(search, args, colorEnabled) {
 
 const MARKDOWN_SEPARATOR = '\n\n---\n\n';
 
+function renderCommentMarkdown(result, colorEnabled) {
+  const c = makeColors(colorEnabled);
+  const data = sanitizeDeep(result);
+  const title = data.dryRun
+    ? `Dry run: Comment on Issue ${data.id}`
+    : `Commented on Issue ${data.id}`;
+  const out = [header(c, title, data.url)];
+  if (data.title) out.push(`- **Title**: ${data.title}`);
+  if (data.status) out.push(`- **Status**: ${data.status}`);
+  out.push(`- **Format**: ${data.markdown ? 'Markdown' : 'Plain text'}`);
+  out.push('');
+  out.push(data.comment.trim());
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
+function renderCloseMarkdown(result, colorEnabled) {
+  const c = makeColors(colorEnabled);
+  const data = sanitizeDeep(result);
+  const title = data.dryRun
+    ? `Dry run: Close Issue ${data.id}`
+    : `Closed Issue ${data.id}`;
+  const out = [header(c, title, data.url)];
+  if (data.title) out.push(`- **Title**: ${data.title}`);
+  const styledStatus = /Fixed|Verified/i.test(data.status)
+    ? c.green(data.status)
+    : c.gray(data.status);
+  const transition = data.previousStatus && data.previousStatus !== data.status
+    ? `${data.previousStatus} -> ${styledStatus}`
+    : styledStatus;
+  out.push(`- **Status**: ${transition}`);
+  if (data.duplicateOf) {
+    const dupUrl = data.duplicateOfUrl || `https://issuetracker.google.com/issues/${data.duplicateOf}`;
+    const dupSuffix = data.duplicateOfTitle ? ` — ${data.duplicateOfTitle}` : '';
+    out.push(`- **Duplicate of**: [${data.duplicateOf}](${dupUrl})${dupSuffix}`);
+  }
+  if (data.assignee) {
+    const note = data.autoAssigned ? ' (auto-assigned)' : '';
+    out.push(`- **Assignee**: ${data.assignee}${note}`);
+  }
+  if (data.comment) {
+    out.push('');
+    out.push(c.bold('### Closing comment'));
+    out.push('');
+    out.push(data.comment.trim());
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
+function formatFieldValue(val, emptyLabel = '<none>') {
+  if (Array.isArray(val)) {
+    return val.length ? val.map(String).join(', ') : emptyLabel;
+  }
+  if (val === null || val === undefined || val === '') return emptyLabel;
+  return String(val);
+}
+
+function renderEditMarkdown(result, colorEnabled) {
+  const c = makeColors(colorEnabled);
+  const data = sanitizeDeep(result);
+  let title;
+  if (data.action === 'assign') {
+    const verb = data.assignee ? 'Assign' : 'Unassign';
+    const past = data.assignee ? 'Assigned' : 'Unassigned';
+    title = data.dryRun
+      ? `Dry run: ${verb} Issue ${data.id}`
+      : `${past} Issue ${data.id}`;
+  } else {
+    title = data.dryRun
+      ? `Dry run: Edit Issue ${data.id}`
+      : `Updated Issue ${data.id}`;
+  }
+  const out = [header(c, title, data.url)];
+  if (data.title) out.push(`- **Title**: ${data.title}`);
+  if (data.noOp) {
+    out.push(`- **Changes**: ${c.dim('(no changes — requested values already match issue)')}`);
+  } else if (Array.isArray(data.changes) && data.changes.length) {
+    for (const ch of data.changes) {
+      const beforeStr = formatFieldValue(ch.before);
+      const afterStr = formatFieldValue(ch.after);
+      const note = ch.auto ? ' (auto)' : '';
+      out.push(`- **${ch.field}**: ${beforeStr} -> ${c.green(afterStr)}${note}`);
+    }
+  }
+  if (data.comment) {
+    out.push('');
+    out.push(c.bold('### Comment'));
+    out.push('');
+    out.push(data.comment.trim());
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
+function renderFieldsMarkdown(result, colorEnabled, { full = false } = {}) {
+  const c = makeColors(colorEnabled);
+  const data = sanitizeDeep(result);
+  const out = [header(c, `Fields for Issue ${data.id}`, data.url)];
+  if (data.title) out.push(`- **Title**: ${data.title}`);
+  out.push('');
+  out.push(c.bold('## Standard Fields'));
+  out.push('');
+  const s = data.standardFields || {};
+  const alwaysEntries = [
+    ['Status', s.status],
+    ['Type', s.type],
+    ['Priority', s.priority],
+    ['Severity', s.severity],
+    ['Component', s.componentId],
+    ['Assignee', s.assignee],
+    ['Verifier', s.verifier],
+    ['Reporter', s.reporter],
+    ['Code Changes', s.codeChanges],
+    ['CC', s.cc],
+    ['Collaborators', s.collaborators],
+  ];
+  const optionalEntries = [
+    ['Pending Code Changes', s.pendingCodeChanges],
+    ['Found In', s.foundIn],
+    ['Targeted To', s.targetedTo],
+    ['Verified In', s.verifiedIn],
+    ['Hotlists', s.hotlists],
+    ['Blocked By', s.blockedBy],
+    ['Blocking', s.blocking],
+  ];
+  for (const [label, val] of alwaysEntries) {
+    out.push(`- **${label}**: ${formatFieldValue(val)}`);
+  }
+  for (const [label, val] of optionalEntries) {
+    const hasVal = Array.isArray(val) ? val.length > 0 : Boolean(val);
+    if (full || hasVal) {
+      out.push(`- **${label}**: ${formatFieldValue(val)}`);
+    }
+  }
+
+  out.push('');
+  out.push(c.bold('## Custom Fields'));
+  out.push('');
+  const cfs = Array.isArray(data.customFields) ? data.customFields : [];
+  if (!cfs.length) {
+    out.push(c.dim('(no custom fields)'));
+  } else {
+    const escCell = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+    out.push('| Field | ID | Type | Value | Allowed Values |');
+    out.push('| --- | --- | --- | --- | --- |');
+    for (const cf of cfs) {
+      const valStr = formatFieldValue(cf.value, '—');
+      let allowedStr = '—';
+      if (Array.isArray(cf.allowedValues) && cf.allowedValues.length) {
+        if (!full && cf.allowedValues.length > 12) {
+          allowedStr = `${cf.allowedValues.slice(0, 12).join(', ')}, … (+${cf.allowedValues.length - 12} more)`;
+        } else {
+          allowedStr = cf.allowedValues.join(', ');
+        }
+      }
+      out.push(
+        `| ${escCell(cf.name)} | ${escCell(cf.id)} | ${escCell(cf.type)} | ${escCell(valStr)} | ${escCell(allowedStr)} |`,
+      );
+    }
+  }
+  if (data.hiddenCustomFieldCount > 0) {
+    out.push('');
+    out.push(
+      c.dim(`(${data.hiddenCustomFieldCount} unpopulated hidden tracker field(s) omitted; pass --full to show all.)`),
+    );
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
+function renderMutationErrorMarkdown(input, errMsg, colorEnabled, verb = 'updating') {
+  const c = makeColors(colorEnabled);
+  return `${c.bold(c.red(`# Error ${verb} \`${sanitizeTerminalText(input)}\``))}\n\n${sanitizeTerminalText(errMsg)}\n`;
+}
+
+// ---------- mutation CLI preparation ----------
+
+function readCommentFromArgs(args, readStdin) {
+  if (args.comment !== null && args.comment !== undefined) {
+    return args.comment;
+  }
+  if (args.commentFile !== null && args.commentFile !== undefined) {
+    return args.commentFile === '-'
+      ? readStdin()
+      : readFileSync(args.commentFile, 'utf8');
+  }
+  return null;
+}
+
+function splitIssueTokens(rawItems) {
+  return rawItems
+    .flatMap((s) => String(s).split(','))
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function prepareCommentInvocation(inputs, args, {
+  stdinIsTTY = Boolean(process.stdin.isTTY),
+  readStdin = () => readFileSync(0, 'utf8'),
+} = {}) {
+  let comment = readCommentFromArgs(args, readStdin);
+  let targets;
+
+  if (comment !== null) {
+    targets = splitIssueTokens(inputs);
+    if (targets.length === 0) {
+      throw new Error('`bnz comment` requires at least one issue id or URL.');
+    }
+  } else if (inputs.length === 0) {
+    throw new Error('`bnz comment` requires an issue id/URL and comment text.');
+  } else if (inputs.length === 2) {
+    targets = splitIssueTokens([inputs[0]]);
+    comment = inputs[1];
+  } else if (inputs.length === 1) {
+    targets = splitIssueTokens([inputs[0]]);
+    if (!stdinIsTTY) {
+      comment = readStdin();
+    } else {
+      throw new Error(
+        'Missing comment text. Pass `bnz comment <id> "<text>"`, `-m "<text>"`, `-F <file>`, or pipe stdin.',
+      );
+    }
+  } else {
+    throw new Error(
+      'Too many positional arguments for `bnz comment`. Quote your comment text or pass `-m "<text>"` for multiple issues.',
+    );
+  }
+
+  if (targets.length === 0) {
+    throw new Error('`bnz comment` requires at least one issue id or URL.');
+  }
+  for (const t of targets) resolveIssueUrl(t);
+  if (typeof comment !== 'string' || !comment.trim()) {
+    throw new Error('Comment text must not be empty.');
+  }
+
+  return {
+    targets,
+    comment,
+    markdown: args.markdown !== false,
+    dryRun: !!args.dryRun,
+  };
+}
+
+function prepareCloseInvocation(inputs, args, {
+  readStdin = () => readFileSync(0, 'utf8'),
+} = {}) {
+  const comment = readCommentFromArgs(args, readStdin);
+  if (comment !== null && !String(comment).trim()) {
+    throw new Error('Closing comment must not be empty.');
+  }
+
+  let status = args.status;
+  let duplicateOf = args.duplicateOf;
+  const setStatus = (val) => {
+    if (status && normalizeStatusToken(status) !== normalizeStatusToken(val)) {
+      throw new Error(`Conflicting close statuses: "${status}" and "${val}"`);
+    }
+    status = val;
+  };
+
+  const targets = [];
+  const tokens = splitIssueTokens(inputs);
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (/^(?:\d+|b\/\d+|https?:\/\/)/i.test(tok)) {
+      targets.push(tok);
+      continue;
+    }
+    const norm = normalizeStatusToken(tok);
+    if (['duplicate', 'dup', 'dupe'].includes(norm)) {
+      setStatus('duplicate');
+      if (!duplicateOf && targets.length > 0 && i + 1 < tokens.length) {
+        let next = tokens[i + 1];
+        if (next.toLowerCase() === 'of' && i + 2 < tokens.length) {
+          i++;
+          next = tokens[i + 1];
+        }
+        duplicateOf = next;
+        i++;
+      }
+      continue;
+    }
+    resolveCloseStatus(tok, undefined);
+    setStatus(tok);
+  }
+
+  if (targets.length === 0) {
+    throw new Error('`bnz close` requires at least one issue id or URL.');
+  }
+  const targetIds = targets.map((t) => resolveIssueUrl(t).match(/(\d+)/)[1]);
+  const resolved = resolveCloseStatus(status, duplicateOf);
+  if (resolved.key === 'duplicate') {
+    const dupId = resolveIssueUrl(String(duplicateOf).trim()).match(/(\d+)/)[1];
+    for (const id of targetIds) {
+      if (id === dupId) {
+        throw new Error(`Issue ${id} cannot be marked as a duplicate of itself.`);
+      }
+    }
+  }
+
+  return {
+    targets,
+    status: status || undefined,
+    duplicateOf: duplicateOf || undefined,
+    comment: comment ?? undefined,
+    markdown: args.markdown !== false,
+    assignee: args.assignee ?? undefined,
+    dryRun: !!args.dryRun,
+  };
+}
+
+function validateCliUserToken(raw, label = 'assignee') {
+  const trimmed = String(raw ?? '').trim();
+  if (!trimmed) {
+    throw new Error(`Expected an email address, "me", or "none" for ${label}.`);
+  }
+  const lower = trimmed.toLowerCase();
+  if (lower === 'me' || ['none', 'null', 'unassigned', 'clear', '-'].includes(lower)) {
+    return trimmed;
+  }
+  if (!trimmed.includes('@') || /\s/.test(trimmed)) {
+    throw new Error(`Invalid ${label} "${raw}" (expected an email address, "me", or "none").`);
+  }
+  return trimmed;
+}
+
+function prepareAssignInvocation(inputs, args, {
+  isUnassign = false,
+  readStdin = () => readFileSync(0, 'utf8'),
+} = {}) {
+  const comment = readCommentFromArgs(args, readStdin);
+  if (comment !== null && !String(comment).trim()) {
+    throw new Error('Comment must not be empty.');
+  }
+
+  if (isUnassign) {
+    if (args.assignee !== null && !['none', 'null', 'unassigned', 'clear', '-'].includes(args.assignee.toLowerCase())) {
+      throw new Error('Cannot combine --assignee with `bnz unassign`.');
+    }
+    const targets = splitIssueTokens(inputs);
+    if (targets.length === 0) {
+      throw new Error('`bnz unassign` requires at least one issue id or URL.');
+    }
+    for (const t of targets) resolveIssueUrl(t);
+    return {
+      targets,
+      assignee: 'none',
+      comment: comment ?? undefined,
+      markdown: args.markdown !== false,
+      dryRun: !!args.dryRun,
+    };
+  }
+
+  let assignee = args.assignee;
+  const targets = [];
+  const tokens = splitIssueTokens(inputs);
+  for (const tok of tokens) {
+    if (assignee !== null) {
+      targets.push(tok);
+      continue;
+    }
+    if (/^(?:\d+|b\/\d+|https?:\/\/)/i.test(tok)) {
+      targets.push(tok);
+    } else if (assignee === null) {
+      assignee = tok;
+    } else {
+      throw new Error(
+        `Unexpected extra argument "${tok}". Pass a single assignee (<email>, "me", or "none").`,
+      );
+    }
+  }
+
+  if (targets.length === 0) {
+    throw new Error('`bnz assign` requires at least one issue id or URL.');
+  }
+  for (const t of targets) resolveIssueUrl(t);
+  if (assignee === null || !String(assignee).trim()) {
+    throw new Error('`bnz assign` requires an assignee (<email>, "me", or "none").');
+  }
+  validateCliUserToken(assignee, 'assignee');
+
+  return {
+    targets,
+    assignee: String(assignee).trim(),
+    comment: comment ?? undefined,
+    markdown: args.markdown !== false,
+    dryRun: !!args.dryRun,
+  };
+}
+
+function splitCommaEntries(rawList) {
+  return rawList
+    .flatMap((v) => String(v).split(','))
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function prepareEditInvocation(inputs, args, {
+  readStdin = () => readFileSync(0, 'utf8'),
+} = {}) {
+  const comment = readCommentFromArgs(args, readStdin);
+  if (comment !== null && !String(comment).trim()) {
+    throw new Error('Comment must not be empty.');
+  }
+
+  const targets = [];
+  const fieldOps = [...(args.fieldOps || [])];
+  for (const raw of inputs) {
+    const str = String(raw);
+    if (!/^https?:\/\//i.test(str) && str.includes('=')) {
+      fieldOps.push(parseFieldSpec(str));
+    } else {
+      targets.push(...splitIssueTokens([str]));
+    }
+  }
+
+  if (targets.length === 0) {
+    throw new Error('`bnz edit` requires at least one issue id or URL.');
+  }
+  for (const t of targets) resolveIssueUrl(t);
+
+  // Upfront validation so obvious typos fail before opening Chromium.
+  if (args.assignee !== null) validateCliUserToken(args.assignee, 'assignee');
+  if (args.verifier !== null) validateCliUserToken(args.verifier, 'verifier');
+  if (args.status !== null) resolveIssueStatus(args.status);
+  if (args.priority !== null) resolvePriority(args.priority);
+  if (args.severity !== null) resolveSeverity(args.severity);
+  if (args.type !== null) resolveIssueType(args.type);
+  if (args.title !== null && !String(args.title).trim()) {
+    throw new Error('Title must not be empty.');
+  }
+  if (args.componentId !== null && !/^\d+$/.test(String(args.componentId).trim())) {
+    throw new Error(`Invalid component ID "${args.componentId}" (expected a numeric component ID).`);
+  }
+  if (args.codeChanges !== undefined) {
+    const trimmed = String(args.codeChanges).trim().toLowerCase();
+    if (trimmed !== '' && trimmed !== 'none' && trimmed !== 'null') {
+      splitCommaEntries([args.codeChanges]).forEach(parseCodeChangeEntry);
+    }
+  }
+  if (args.addCodeChanges?.length) {
+    splitCommaEntries(args.addCodeChanges).forEach(parseCodeChangeEntry);
+  }
+  if (args.removeCodeChanges?.length) {
+    splitCommaEntries(args.removeCodeChanges).forEach(parseCodeChangeEntry);
+  }
+
+  const addCc = args.addCc?.length ? args.addCc : undefined;
+  const removeCc = args.removeCc?.length ? args.removeCc : undefined;
+  const addCollaborators = args.addCollaborators?.length ? args.addCollaborators : undefined;
+  const removeCollaborators = args.removeCollaborators?.length ? args.removeCollaborators : undefined;
+  const addCodeChanges = args.addCodeChanges?.length ? args.addCodeChanges : undefined;
+  const removeCodeChanges = args.removeCodeChanges?.length ? args.removeCodeChanges : undefined;
+
+  const hasMutation =
+    args.assignee !== null ||
+    args.status !== null ||
+    args.priority !== null ||
+    args.severity !== null ||
+    args.type !== null ||
+    args.title !== null ||
+    args.componentId !== null ||
+    args.verifier !== null ||
+    args.cc !== undefined || Boolean(addCc) || Boolean(removeCc) ||
+    args.collaborators !== undefined || Boolean(addCollaborators) || Boolean(removeCollaborators) ||
+    args.codeChanges !== undefined || Boolean(addCodeChanges) || Boolean(removeCodeChanges) ||
+    fieldOps.length > 0 ||
+    comment !== null;
+
+  if (!hasMutation) {
+    throw new Error(
+      'No field updates specified for `bnz edit`. Pass flags like `--assignee=...`, ' +
+      '`--os=...`, `--add-code-change=...`, or `-f "Field=Value"`.',
+    );
+  }
+
+  return {
+    targets,
+    assignee: args.assignee ?? undefined,
+    status: args.status ?? undefined,
+    priority: args.priority ?? undefined,
+    severity: args.severity ?? undefined,
+    type: args.type ?? undefined,
+    title: args.title ?? undefined,
+    componentId: args.componentId ?? undefined,
+    verifier: args.verifier ?? undefined,
+    cc: args.cc,
+    addCc,
+    removeCc,
+    collaborators: args.collaborators,
+    addCollaborators,
+    removeCollaborators,
+    codeChanges: args.codeChanges,
+    addCodeChanges,
+    removeCodeChanges,
+    fieldOps,
+    comment: comment ?? undefined,
+    markdown: args.markdown !== false,
+    dryRun: !!args.dryRun,
+  };
+}
+
+function prepareFieldsInvocation(inputs) {
+  const targets = splitIssueTokens(inputs);
+  if (targets.length === 0) {
+    throw new Error('`bnz fields` requires at least one issue id or URL.');
+  }
+  for (const t of targets) resolveIssueUrl(t);
+  return { targets };
+}
+
 // ---------- commands ----------
+
+async function runBatchMutation(targets, fn, args, colorEnabled, renderOk, errorVerb = 'updating') {
+  const entries = [];
+  for (const target of targets) {
+    try {
+      entries.push({ ok: true, target, data: await fn(target) });
+    } catch (err) {
+      if (err instanceof AuthRequiredError) throw err;
+      entries.push({ ok: false, target, error: String(err.message || err) });
+    }
+  }
+  const anyFail = entries.some((e) => !e.ok);
+  if (entries.length === 1 && anyFail) {
+    throw new Error(entries[0].error);
+  }
+  if (anyFail) process.exitCode = 1;
+
+  if (args.format === 'json') {
+    const mapped = entries.map((e) =>
+      e.ok ? e.data : { input: e.target, ok: false, error: e.error });
+    const payload = mapped.length === 1 ? mapped[0] : mapped;
+    console.log(JSON.stringify(sanitizeDeep(payload), null, 2));
+    return;
+  }
+  console.log(
+    entries
+      .map((e) => e.ok
+        ? renderOk(e.data)
+        : renderMutationErrorMarkdown(e.target, e.error, colorEnabled, errorVerb))
+      .join(MARKDOWN_SEPARATOR),
+  );
+}
+
+async function commentCmd(session, plan, args, colorEnabled) {
+  await runBatchMutation(
+    plan.targets,
+    (target) => commentIssue(session, target, {
+      comment: plan.comment,
+      markdown: plan.markdown,
+      dryRun: plan.dryRun,
+    }),
+    args,
+    colorEnabled,
+    (r) => renderCommentMarkdown(r, colorEnabled),
+  );
+}
+
+async function closeCmd(session, plan, args, colorEnabled) {
+  await runBatchMutation(
+    plan.targets,
+    (target) => closeIssue(session, target, {
+      status: plan.status,
+      duplicateOf: plan.duplicateOf,
+      comment: plan.comment,
+      markdown: plan.markdown,
+      assignee: plan.assignee,
+      dryRun: plan.dryRun,
+    }),
+    args,
+    colorEnabled,
+    (r) => renderCloseMarkdown(r, colorEnabled),
+  );
+}
+
+async function assignCmd(session, plan, args, colorEnabled) {
+  await runBatchMutation(
+    plan.targets,
+    (target) => assignIssue(session, target, {
+      assignee: plan.assignee,
+      comment: plan.comment,
+      markdown: plan.markdown,
+      dryRun: plan.dryRun,
+    }),
+    args,
+    colorEnabled,
+    (r) => renderEditMarkdown(r, colorEnabled),
+  );
+}
+
+async function editCmd(session, plan, args, colorEnabled) {
+  const { targets, ...editOpts } = plan;
+  await runBatchMutation(
+    targets,
+    (target) => editIssue(session, target, editOpts),
+    args,
+    colorEnabled,
+    (r) => renderEditMarkdown(r, colorEnabled),
+  );
+}
+
+async function fieldsCmd(session, plan, args, colorEnabled) {
+  await runBatchMutation(
+    plan.targets,
+    (target) => fetchIssueFields(session, target, { full: !!args.full }),
+    args,
+    colorEnabled,
+    (r) => renderFieldsMarkdown(r, colorEnabled, { full: !!args.full }),
+    'fetching fields for',
+  );
+}
 
 async function issuesCmd(session, inputs, args, colorEnabled) {
   const targets = inputs.map(resolveIssueUrl);
@@ -384,12 +1388,10 @@ async function cfCmd(session, inputs, args, colorEnabled) {
 }
 
 async function listCmd(session, inputs, args, colorEnabled) {
-  if (inputs.length === 0) {
-    throw new Error('list requires a query, e.g. `bug list "reporter:me status:open"`');
-  }
-  const result = await searchIssues(session, inputs.join(' '), args);
+  const query = inputs.length ? inputs.join(' ') : DEFAULT_LIST_QUERY;
+  const result = await searchIssues(session, query, args);
   if (args.format === 'json') {
-    console.log(JSON.stringify(result, null, 2));
+    console.log(JSON.stringify(sanitizeDeep(result), null, 2));
     return;
   }
   console.log(renderListMarkdown(result, args, colorEnabled));
@@ -448,12 +1450,35 @@ async function main() {
     return;
   }
 
+  let commandPlan = null;
+  if (cmd === 'comment') {
+    commandPlan = prepareCommentInvocation(args._.slice(1), args);
+  } else if (cmd === 'close') {
+    commandPlan = prepareCloseInvocation(args._.slice(1), args);
+  } else if (cmd === 'assign' || cmd === 'unassign') {
+    commandPlan = prepareAssignInvocation(args._.slice(1), args, { isUnassign: cmd === 'unassign' });
+  } else if (cmd === 'edit' || cmd === 'set') {
+    commandPlan = prepareEditInvocation(args._.slice(1), args);
+  } else if (cmd === 'fields') {
+    commandPlan = prepareFieldsInvocation(args._.slice(1));
+  }
+
   const session = await openSession();
   try {
     if (cmd === 'cf') {
       await cfCmd(session, args._.slice(1), args, colorEnabled);
     } else if (cmd === 'list') {
       await listCmd(session, args._.slice(1), args, colorEnabled);
+    } else if (cmd === 'comment') {
+      await commentCmd(session, commandPlan, args, colorEnabled);
+    } else if (cmd === 'close') {
+      await closeCmd(session, commandPlan, args, colorEnabled);
+    } else if (cmd === 'assign' || cmd === 'unassign') {
+      await assignCmd(session, commandPlan, args, colorEnabled);
+    } else if (cmd === 'edit' || cmd === 'set') {
+      await editCmd(session, commandPlan, args, colorEnabled);
+    } else if (cmd === 'fields') {
+      await fieldsCmd(session, commandPlan, args, colorEnabled);
     } else {
       await issuesCmd(session, args._, args, colorEnabled);
     }
@@ -468,7 +1493,17 @@ export {
   extractSearchRows,
   findTestcaseKeyInMarkdown,
   parseArgs,
+  parseFieldSpec,
   parseSince,
+  prepareAssignInvocation,
+  prepareCloseInvocation,
+  prepareCommentInvocation,
+  prepareEditInvocation,
+  prepareFieldsInvocation,
+  renderCloseMarkdown,
+  renderCommentMarkdown,
+  renderEditMarkdown,
+  renderFieldsMarkdown,
   renderIssueMarkdown,
   renderListMarkdown,
   renderTestcaseMarkdown,

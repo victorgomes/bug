@@ -6,11 +6,14 @@ import test from 'node:test';
 
 import {
   extractSearchHits, extractSearchRows, findTestcaseKeyInMarkdown,
-  parseArgs, parseSince, sanitizeFilename,
+  parseArgs, parseSince, renderListMarkdown, sanitizeFilename,
 } from '../bnz.js';
 import {
   exportSessionState, importSessionState, pushSessionOverSsh,
 } from '../lib/browser.js';
+import {
+  DEFAULT_LIST_QUERY, computeIssueSlo, parseIssueSearchPayload, sortHitsBySlo,
+} from '../lib/fetch.js';
 import { sanitizeDeep, sanitizeTerminalText } from '../lib/render.js';
 
 test('parseArgs picks up flags and positional targets', () => {
@@ -195,4 +198,79 @@ await importSessionState(raw, { profileDir: ${JSON.stringify(dstDir)} });
     rmSync(srcDir, { recursive: true, force: true });
     rmSync(dstDir, { recursive: true, force: true });
   }
+});
+
+test('extractSearchRows handles issuetracker tables without 7D VIEWS column', () => {
+  const md = `## Issue search results
+
+**1 - 2** of **2**
+
+|     |     |     | P   | TYPE | TITLE | ASSIGNEE | STATUS | ID  | LAST MODIFIED |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|     |     |     | P1  | Vulnerability | [\\[Merge M158\\] CHECK: a \\| b](https://issuetracker.google.com/issues/579236510) | victorgomes@chromium.org | Assigned | [579236510](https://issuetracker.google.com/issues/579236510) | Oct 29, 2026 03:19PM |
+|     |     |     | P2  | Bug | [Some bug](https://issuetracker.google.com/issues/100) | -- | In Progress | [100](https://issuetracker.google.com/issues/100) | Oct 01, 2026 09:00AM |
+`;
+  const rows = extractSearchRows(md);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].id, '579236510');
+  assert.equal(rows[0].priority, 'P1');
+  assert.equal(rows[0].type, 'Vulnerability');
+  assert.equal(rows[0].title, '[Merge M158] CHECK: a | b');
+  assert.equal(rows[0].status, 'Assigned');
+  assert.equal(rows[0].views7d, 0);
+  assert.equal(rows[1].assignee, '');
+  assert.equal(rows[1].status, 'In Progress');
+});
+
+test('parseArgs accepts list --slo and rejects --slo on non-list commands', () => {
+  assert.equal(DEFAULT_LIST_QUERY, 'assignee:me status:open');
+  const a = parseArgs(['list', '--slo']);
+  assert.deepEqual(a._, ['list']);
+  assert.equal(a.slo, true);
+  assert.throws(() => parseArgs(['12345', '--slo']), /--slo requires list/);
+});
+
+test('parseIssueSearchPayload, computeIssueSlo, and renderListMarkdown (--slo) group and sort by SLO', () => {
+  const nowMs = Date.parse('2026-10-30T12:00:00Z');
+  const day = 86_400;
+  const nowSec = Math.floor(nowMs / 1000);
+  const rawPayload = `)]}'\n` + JSON.stringify([[
+    'b.IssueSearchResponse', null, null, null, null, null,
+    [[
+      [null, 10, [1, 1, 2, 2, 3, 'PostMortem for 999 - deopt bug', null, ['me@chromium.org'], null, null, null, null, null, null, []], null, [nowSec - 72 * day, 0], [nowSec - 56 * day, 0], null, null, [], null, null, null, null, null, []],
+      [null, 20, [1, 6, 2, 2, 2, '[Merge M158] WriteBarrier', null, ['me@chromium.org'], null, null, null, null, null, null, [[1223087, null, null, null, null, null, null, null, null, 'Pending']]], null, [nowSec - 1 * day, 0], [nowSec - 1 * day, 0], null, null, [], null, null, null, null, null, [[1223087, 1, 1, null, 'Merge']]],
+      [null, 30, [1, 6, 2, 2, 3, 'S2 vulnerability in Maglev', null, ['me@chromium.org'], null, null, null, null, null, null, []], null, [nowSec - 8 * day, 0], [nowSec, 0], null, null, [], null, null, null, null, null, []],
+      [null, 40, [1, 1, 2, 3, 3, 'Normal P2 cleanup bug', null, ['me@chromium.org'], null, null, null, null, null, null, []], null, [nowSec - 10 * day, 0], [nowSec - 5 * day, 0], null, null, [], null, null, null, null, null, []],
+    ]],
+  ]]);
+
+  const parsed = parseIssueSearchPayload(rawPayload);
+  assert.equal(parsed.length, 4);
+  assert.equal(parsed[1].customFields.Merge, 'Pending');
+  assert.equal(parsed[2].severity, 'S2');
+
+  const sorted = sortHitsBySlo(parsed, nowMs);
+  assert.deepEqual(sorted.map((h) => h.id), ['10', '20', '30', '40']);
+  assert.equal(sorted[0].slo.bucket, 'overdue');
+  assert.equal(sorted[0].slo.rule, 'PostMortem (4w)');
+  assert.equal(sorted[1].slo.bucket, 'due_soon');
+  assert.equal(sorted[1].slo.rule, 'Sec Merge (5d)');
+  assert.equal(sorted[2].slo.bucket, 'in_slo');
+  assert.equal(sorted[2].slo.rule, 'Vuln S2 (12w)');
+  assert.equal(sorted[3].slo.bucket, 'none');
+
+  const md = renderListMarkdown(
+    { query: DEFAULT_LIST_QUERY, searchUrl: 'https://issuetracker.google.com/issues', hits: sorted, slo: true },
+    { slo: true },
+    false,
+  );
+  assert.match(md, /# Search \(by SLO\): assignee:me status:open/);
+  assert.match(md, /1 out of SLO/);
+  assert.match(md, /1 due <=7d/);
+  assert.match(md, /1 in SLO/);
+  assert.match(md, /1 out of scope/);
+  assert.match(md, /## Out of SLO \(1\)/);
+  assert.match(md, /## Due Within 7 Days \(1\)/);
+  assert.match(md, /## In SLO \(1\)/);
+  assert.match(md, /## Out of SLO Scope \(1\)/);
 });
