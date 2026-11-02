@@ -271,7 +271,7 @@ const TOOLS = [
   {
     name: 'bnz_edit',
     description:
-      'Update standard fields (assignee, priority, severity, status, type, title, component, verifier, Code Changes, CC, collaborators, Found In, Targeted To, Verified In) and/or custom fields (e.g. OS, Merge-Request, Safe Merge) on one or more Buganizer issues, with an optional comment. Invalidates the local issue cache.',
+      'Update standard fields (issue `type` such as downgrading `vulnerability` -> `bug` or promoting `bug` -> `vulnerability`, `priority` `P0`..`P4`, `severity` `S0`..`S4`, `assignee`, `status`, `title`, `component_id`, `verifier`, `code_changes`, `cc`, `collaborators`, `found_in`, `targeted_to`, `verified_in`) and/or custom fields (e.g. `OS`, `Merge-Request`, `Safe Merge`) on one or more Buganizer issues, with an optional comment. Invalidates the local issue cache.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -293,15 +293,16 @@ const TOOLS = [
         },
         priority: {
           type: 'string',
-          description: 'Priority (`P0`, `P1`, `P2`, `P3`, or `P4`).',
+          description: 'Priority (`P0`, `P1`, `P2`, `P3`, `P4`, or `0`..`4`).',
         },
         severity: {
           type: 'string',
-          description: 'Severity (`S0`, `S1`, `S2`, `S3`, or `S4`).',
+          description: 'Severity (`S0`, `S1`, `S2`, `S3`, `S4`, or `0`..`4`; in Chromium `S4` represents non-security / no security impact).',
         },
         type: {
           type: 'string',
-          description: 'Issue type (`bug`, `vulnerability`, `feature-request`, `task`, `customer-issue`, `internal-cleanup`, `privacy-issue`, etc.).',
+          description:
+            'Issue type (`bug`, `vulnerability` / `vuln`, `feature-request`, `task`, `customer-issue`, `internal-cleanup`, `process`, `privacy-issue`, `portfolio`, `program`, `project`, `feature`, `milestone`, `epic`, `story`). On Chromium, `vulnerability` -> `bug` updates atomically alongside `priority`/`severity`/`comment`; `bug` -> `vulnerability` invokes Buganizer\'s `markAsVulnerability` endpoint to apply security view restrictions and `security@chromium.org` collaboration.',
         },
         title: {
           type: 'string',

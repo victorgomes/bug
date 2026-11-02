@@ -23,6 +23,7 @@ import {
   assignIssue, closeIssue, commentIssue, editIssue, fetchIssueFields,
   normalizeStatusToken, parseCodeChangeEntry, resolveCloseStatus,
   resolveIssueStatus, resolveIssueType, resolvePriority, resolveSeverity,
+  tryResolveIssueType,
 } from './lib/mutate.js';
 import {
   resolveCfTarget, resolveIssueUrl,
@@ -49,6 +50,9 @@ Usage:
   bnz fields <id|url> [...] [--full]     List standard and custom fields + allowed values.
   bnz assign <id|url> [...] <email|me|none>  Assign (or unassign with "none") one or more issues.
   bnz unassign <id|url> [...]            Clear assignee on one or more issues.
+  bnz type <id|url> [...] <bug|vuln|...> Change issue type (e.g. Vulnerability -> Bug).
+  bnz priority <id|url> [...] <P0..P4>   Change priority (alias: bnz pri; accepts P0..P4 or 0..4).
+  bnz severity <id|url> [...] <S0..S4>   Change severity (alias: bnz sev; accepts S0..S4 or 0..4).
   bnz edit <id|url> [...] [options]      Update standard or custom fields (alias: bnz set).
   bnz comment <id|url> "<text>"          Post a comment on an issue (Markdown by default).
   bnz comment <id|url> [...] -m "<text>" Post a comment on one or more issues (or -F <file>).
@@ -58,12 +62,13 @@ Usage:
                                          IDs may be comma-separated, quoted or unquoted.
   bnz list ["<query>"]                   Search issuetracker (default: "assignee:me status:open").
 
-Edit & field options (for \`bnz edit\` / \`bnz assign\`):
+Edit & field options (for \`bnz edit\`, \`bnz type\`, \`bnz priority\`, \`bnz severity\`, \`bnz assign\`):
   --assignee=<email|me|none>             Set assignee, or pass "none" (or --unassign) to clear.
-  -p, --priority=<P0..P4>                Set priority (P0, P1, P2, P3, P4).
-  --severity=<S0..S4>                    Set severity (S0, S1, S2, S3, S4).
+  -p, --priority=<P0..P4|0..4>           Set priority (or shorthand --p0 .. --p4; alias: --pri).
+  -S, --severity=<S0..S4|0..4>           Set severity (or shorthand --s0 .. --s4; alias: --sev).
+  -t, --type=<type>                      Set issue type (bug, vulnerability/vuln, feature-request, task, ...).
+  --bug | --vulnerability (--vuln)       Shorthand flags for --type=bug or --type=vulnerability.
   -s, --status=<status>                  Set status (new, assigned, in-progress, or close status).
-  --type=<type>                          Set issue type (bug, vulnerability, feature-request, task, ...).
   --title=<text>                         Set issue title.
   --component=<id>                       Move issue to numeric component ID.
   --verifier=<email|me|none>             Set or clear verifier.
@@ -220,6 +225,47 @@ function parseArgs(argv) {
     }
     args.duplicateOf = val;
   };
+  const setPriority = (val) => {
+    if (val === undefined || val === null || String(val).trim() === '') {
+      throw new Error('Expected a priority (P0..P4 or 0..4)');
+    }
+    if (args.priority !== null) {
+      let same = normalizeStatusToken(args.priority) === normalizeStatusToken(val);
+      if (!same) {
+        try { same = resolvePriority(args.priority).id === resolvePriority(val).id; } catch {}
+      }
+      if (!same) throw new Error(`Conflicting priorities: "${args.priority}" and "${val}"`);
+    }
+    args.priority = String(val);
+  };
+  const setSeverity = (val) => {
+    if (val === undefined || val === null || String(val).trim() === '') {
+      throw new Error('Expected a severity (S0..S4 or 0..4)');
+    }
+    if (args.severity !== null) {
+      let same = normalizeStatusToken(args.severity) === normalizeStatusToken(val);
+      if (!same) {
+        try { same = resolveSeverity(args.severity).id === resolveSeverity(val).id; } catch {}
+      }
+      if (!same) throw new Error(`Conflicting severities: "${args.severity}" and "${val}"`);
+    }
+    args.severity = String(val);
+  };
+  const setType = (val) => {
+    if (val === undefined || val === null || String(val).trim() === '') {
+      throw new Error('Expected an issue type (e.g. bug, vulnerability, feature-request, task)');
+    }
+    if (args.type !== null) {
+      let same = normalizeStatusToken(args.type) === normalizeStatusToken(val);
+      if (!same) {
+        const a = tryResolveIssueType(args.type);
+        const b = tryResolveIssueType(val);
+        if (a && b) same = a.id === b.id;
+      }
+      if (!same) throw new Error(`Conflicting issue types: "${args.type}" and "${val}"`);
+    }
+    args.type = String(val);
+  };
   const takeVal = (iRef, flag) => {
     const eq = flag.indexOf('=');
     if (eq !== -1) return flag.slice(eq + 1);
@@ -303,14 +349,31 @@ function parseArgs(argv) {
     else if (a === '--unassign') {
       args.assignee = 'none';
     }
-    else if (a === '-p' || a === '--priority' || a.startsWith('-p=') || a.startsWith('--priority=')) {
-      args.priority = takeVal(iRef, a);
+    else if (a === '-p' || a === '--priority' || a === '--pri' ||
+             a.startsWith('-p=') || a.startsWith('--priority=') || a.startsWith('--pri=')) {
+      setPriority(takeVal(iRef, a));
     }
-    else if (a === '--severity' || a.startsWith('--severity=')) {
-      args.severity = takeVal(iRef, a);
+    else if (/^--p[0-4]$/i.test(a)) {
+      setPriority(a.slice(2).toUpperCase());
     }
-    else if (a === '--type' || a.startsWith('--type=')) {
-      args.type = takeVal(iRef, a);
+    else if (a === '-S' || a === '--severity' || a === '--sev' ||
+             a.startsWith('-S=') || a.startsWith('--severity=') || a.startsWith('--sev=')) {
+      setSeverity(takeVal(iRef, a));
+    }
+    else if (/^--s[0-4]$/i.test(a)) {
+      setSeverity(a.slice(2).toUpperCase());
+    }
+    else if (a === '-t' || a === '--type' || a.startsWith('-t=') || a.startsWith('--type=')) {
+      setType(takeVal(iRef, a));
+    }
+    else if (a === '--bug') {
+      setType('bug');
+    }
+    else if (a === '--vulnerability' || a === '--vuln') {
+      setType('vulnerability');
+    }
+    else if (a === '--feature-request') {
+      setType('feature-request');
     }
     else if (a === '--title' || a.startsWith('--title=')) {
       args.title = takeVal(iRef, a);
@@ -404,7 +467,11 @@ function parseArgs(argv) {
   }
   if (!args.help) {
     const cmd = args._[0];
-    const isEdit = cmd === 'edit' || cmd === 'set';
+    const isEdit =
+      cmd === 'edit' || cmd === 'set' ||
+      cmd === 'type' ||
+      cmd === 'priority' || cmd === 'pri' ||
+      cmd === 'severity' || cmd === 'sev';
     const isAssign = cmd === 'assign' || cmd === 'unassign';
     const isMutate = cmd === 'comment' || cmd === 'close' || isEdit || isAssign;
     const hasEditOnlyFlags =
@@ -432,14 +499,17 @@ function parseArgs(argv) {
       throw new Error('--assignee and --unassign require `bnz assign`, `bnz edit`, or `bnz close`');
     }
     if (hasEditOnlyFlags && !isEdit) {
-      throw new Error('Field modification flags require `bnz edit` (e.g. `bnz edit <id> --os=... --code-changes=...`)');
+      throw new Error(
+        'Field modification flags require `bnz edit`, `bnz type`, `bnz priority`, or `bnz severity` ' +
+        '(e.g. `bnz edit <id> --bug -p P2 -S S4`)',
+      );
     }
     if (
       (args.comment !== null || args.commentFile !== null || !args.markdown || args.dryRun) &&
       !isMutate
     ) {
       throw new Error(
-        'Comment, --plain, and --dry-run flags require `bnz comment`, `bnz close`, `bnz assign`, or `bnz edit`',
+        'Comment, --plain, and --dry-run flags require `bnz comment`, `bnz close`, `bnz assign`, `bnz edit`, `bnz type`, `bnz priority`, or `bnz severity`',
       );
     }
     const isLogin = cmd === 'login' || (cmd === 'cf' && args._[1] === 'login');
@@ -1110,12 +1180,39 @@ function splitCommaEntries(rawList) {
 }
 
 function prepareEditInvocation(inputs, args, {
+  mode = 'edit',
+  cmdName = null,
   readStdin = () => readFileSync(0, 'utf8'),
 } = {}) {
+  const labelCmd = cmdName || (mode === 'edit' ? 'edit' : mode);
   const comment = readCommentFromArgs(args, readStdin);
   if (comment !== null && !String(comment).trim()) {
     throw new Error('Comment must not be empty.');
   }
+
+  let priority = args.priority;
+  let severity = args.severity;
+  let type = args.type;
+
+  const assignPriority = (val) => {
+    if (priority !== null && resolvePriority(priority).id !== resolvePriority(val).id) {
+      throw new Error(`Conflicting priorities: "${priority}" and "${val}"`);
+    }
+    priority = String(val);
+  };
+  const assignSeverity = (val) => {
+    if (severity !== null && resolveSeverity(severity).id !== resolveSeverity(val).id) {
+      throw new Error(`Conflicting severities: "${severity}" and "${val}"`);
+    }
+    severity = String(val);
+  };
+  const assignType = (val) => {
+    const resolved = resolveIssueType(val);
+    if (type !== null && resolveIssueType(type).id !== resolved.id) {
+      throw new Error(`Conflicting issue types: "${type}" and "${val}"`);
+    }
+    type = String(val);
+  };
 
   const targets = [];
   const fieldOps = [...(args.fieldOps || [])];
@@ -1123,23 +1220,55 @@ function prepareEditInvocation(inputs, args, {
     const str = String(raw);
     if (!/^https?:\/\//i.test(str) && str.includes('=')) {
       fieldOps.push(parseFieldSpec(str));
-    } else {
-      targets.push(...splitIssueTokens([str]));
+      continue;
+    }
+    for (const tok of splitIssueTokens([str])) {
+      if (mode === 'priority' && /^[0-4]$/.test(tok)) {
+        assignPriority(tok);
+      } else if (mode === 'severity' && /^[0-4]$/.test(tok)) {
+        assignSeverity(tok);
+      } else if (/^(?:\d+|b\/\d+|https?:\/\/)/i.test(tok)) {
+        targets.push(tok);
+      } else if (/^[pP][0-4]$/.test(tok)) {
+        assignPriority(tok);
+      } else if (/^[sS][0-4]$/.test(tok)) {
+        assignSeverity(tok);
+      } else if (tryResolveIssueType(tok)) {
+        assignType(tok);
+      } else if (mode === 'type') {
+        assignType(tok); // throws Unknown issue type ...
+      } else if (mode === 'priority') {
+        resolvePriority(tok); // throws Invalid priority ...
+      } else if (mode === 'severity') {
+        resolveSeverity(tok); // throws Invalid severity ...
+      } else {
+        resolveIssueUrl(tok);
+      }
     }
   }
 
   if (targets.length === 0) {
-    throw new Error('`bnz edit` requires at least one issue id or URL.');
+    throw new Error(`\`bnz ${labelCmd}\` requires at least one issue id or URL.`);
   }
   for (const t of targets) resolveIssueUrl(t);
+
+  if (mode === 'type' && type === null) {
+    throw new Error('`bnz type` requires an issue type (e.g. `bug`, `vulnerability`, `feature-request`, `task`).');
+  }
+  if (mode === 'priority' && priority === null) {
+    throw new Error(`\`bnz ${labelCmd}\` requires a priority (\`P0\`..\`P4\` or \`0\`..\`4\`).`);
+  }
+  if (mode === 'severity' && severity === null) {
+    throw new Error(`\`bnz ${labelCmd}\` requires a severity (\`S0\`..\`S4\` or \`0\`..\`4\`).`);
+  }
 
   // Upfront validation so obvious typos fail before opening Chromium.
   if (args.assignee !== null) validateCliUserToken(args.assignee, 'assignee');
   if (args.verifier !== null) validateCliUserToken(args.verifier, 'verifier');
   if (args.status !== null) resolveIssueStatus(args.status);
-  if (args.priority !== null) resolvePriority(args.priority);
-  if (args.severity !== null) resolveSeverity(args.severity);
-  if (args.type !== null) resolveIssueType(args.type);
+  if (priority !== null) resolvePriority(priority);
+  if (severity !== null) resolveSeverity(severity);
+  if (type !== null) resolveIssueType(type);
   if (args.title !== null && !String(args.title).trim()) {
     throw new Error('Title must not be empty.');
   }
@@ -1169,9 +1298,9 @@ function prepareEditInvocation(inputs, args, {
   const hasMutation =
     args.assignee !== null ||
     args.status !== null ||
-    args.priority !== null ||
-    args.severity !== null ||
-    args.type !== null ||
+    priority !== null ||
+    severity !== null ||
+    type !== null ||
     args.title !== null ||
     args.componentId !== null ||
     args.verifier !== null ||
@@ -1183,8 +1312,8 @@ function prepareEditInvocation(inputs, args, {
 
   if (!hasMutation) {
     throw new Error(
-      'No field updates specified for `bnz edit`. Pass flags like `--assignee=...`, ' +
-      '`--os=...`, `--add-code-change=...`, or `-f "Field=Value"`.',
+      'No field updates specified for `bnz edit`. Pass flags like `--bug`, `-p P2`, `-S S4`, ' +
+      '`--assignee=...`, `--os=...`, `--add-code-change=...`, or `-f "Field=Value"`.',
     );
   }
 
@@ -1192,9 +1321,9 @@ function prepareEditInvocation(inputs, args, {
     targets,
     assignee: args.assignee ?? undefined,
     status: args.status ?? undefined,
-    priority: args.priority ?? undefined,
-    severity: args.severity ?? undefined,
-    type: args.type ?? undefined,
+    priority: priority ?? undefined,
+    severity: severity ?? undefined,
+    type: type ?? undefined,
     title: args.title ?? undefined,
     componentId: args.componentId ?? undefined,
     verifier: args.verifier ?? undefined,
@@ -1451,14 +1580,26 @@ async function main() {
   }
 
   let commandPlan = null;
+  const editModeByCmd = {
+    edit: 'edit',
+    set: 'edit',
+    type: 'type',
+    priority: 'priority',
+    pri: 'priority',
+    severity: 'severity',
+    sev: 'severity',
+  };
   if (cmd === 'comment') {
     commandPlan = prepareCommentInvocation(args._.slice(1), args);
   } else if (cmd === 'close') {
     commandPlan = prepareCloseInvocation(args._.slice(1), args);
   } else if (cmd === 'assign' || cmd === 'unassign') {
     commandPlan = prepareAssignInvocation(args._.slice(1), args, { isUnassign: cmd === 'unassign' });
-  } else if (cmd === 'edit' || cmd === 'set') {
-    commandPlan = prepareEditInvocation(args._.slice(1), args);
+  } else if (editModeByCmd[cmd]) {
+    commandPlan = prepareEditInvocation(args._.slice(1), args, {
+      mode: editModeByCmd[cmd],
+      cmdName: cmd,
+    });
   } else if (cmd === 'fields') {
     commandPlan = prepareFieldsInvocation(args._.slice(1));
   }
@@ -1475,7 +1616,7 @@ async function main() {
       await closeCmd(session, commandPlan, args, colorEnabled);
     } else if (cmd === 'assign' || cmd === 'unassign') {
       await assignCmd(session, commandPlan, args, colorEnabled);
-    } else if (cmd === 'edit' || cmd === 'set') {
+    } else if (editModeByCmd[cmd]) {
       await editCmd(session, commandPlan, args, colorEnabled);
     } else if (cmd === 'fields') {
       await fieldsCmd(session, commandPlan, args, colorEnabled);

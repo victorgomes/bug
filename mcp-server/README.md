@@ -61,13 +61,15 @@ CLI does: bare numeric ids, `b/<id>` shortcuts, and full URLs. `bnz_cf` also
 accepts an issue id, in which case the testcase link is extracted from the
 issue body.
 
-`bnz_edit` updates standard fields (`assignee` including `"me"` or `"none"` to
-unassign, `priority`, `severity`, `status`, `code_changes` / `add_code_changes`
-with full `/c/<repo>/+/<cl>` Gerrit URLs or Critique CLs, `cc`,
-`collaborators`, etc.) and any component custom fields via `fields` (set or
-`null` to clear), `add_fields` (append to repeated fields like `OS`),
-`remove_fields`, and `clear_fields`. Use `bnz_fields` to inspect an issue's
-available custom field names, types, and allowed enum values.
+`bnz_edit` updates standard fields (`type` such as downgrading `"vulnerability"`
+-> `"bug"` or promoting `"bug"` -> `"vulnerability"`, `priority` `P0`..`P4`,
+`severity` `S0`..`S4`, `assignee` including `"me"` or `"none"` to unassign,
+`status`, `code_changes` / `add_code_changes` with full `/c/<repo>/+/<cl>`
+Gerrit URLs or Critique CLs, `cc`, `collaborators`, etc.) and any component
+custom fields via `fields` (set or `null` to clear), `add_fields` (append to
+repeated fields like `OS`), `remove_fields`, and `clear_fields`. Use
+`bnz_fields` to inspect an issue's available custom field names, types, and
+allowed enum values.
 
 `bnz_close` supports `status` values `fixed` (default, or `duplicate` when
 `duplicate_of` is set), `verified`, `duplicate`, `wontfix` / `infeasible`,

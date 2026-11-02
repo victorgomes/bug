@@ -145,12 +145,20 @@ status change, assignee update, and closing comment (`-m` / `-F`) are submitted
 in a single atomic Buganizer update. Duplicate targets work even when the
 canonical issue is already closed, older than 365 days, or in another component.
 
-### Assign, edit fields, or inspect field schemas
+### Assign, triage type/priority/severity, edit fields, or inspect field schemas
 
 ```sh
 # Inspect all standard + custom fields, current values, and allowed enum choices:
 bnz fields 579236924
 bnz fields 579236924 --full            # also show unpopulated hidden tracker fields
+
+# Downgrade a Vulnerability to a Bug and update Priority / Severity:
+bnz edit 577305517 --bug -p P2 -S S4 -m "DCHECK-only failure, not a security vulnerability."
+bnz edit 577305517 bug P2 S4           # positional shorthands also work
+bnz type 577305517 bug                 # dedicated type / priority / severity subcommands
+bnz priority 577305517 P2              # alias: bnz pri 577305517 2
+bnz severity 577305517 S4              # alias: bnz sev 577305517 4
+bnz type 577305517 vuln -p P1 -S S1    # promote Bug -> Vulnerability (restricts access on Chromium)
 
 # Assign or unassign:
 bnz assign 579236924 merges@chromium.org
@@ -167,12 +175,13 @@ bnz edit 579236924 \
 
 # Append, remove, or clear repeated / scalar fields:
 bnz edit 579236924 --add-os=ChromeOS --remove-os=Fuchsia
-bnz edit 579236924 "OS+=iOS" "Merge-Request+=157" -p P1 --severity=S1
+bnz edit 579236924 "OS+=iOS" "Merge-Request+=157" -p P1 -S S1
 bnz edit 579236924 --clear-field "Safe Merge" --dry-run
 ```
 
-Notes on `bnz edit` (alias `bnz set`) and `bnz assign`:
+Notes on `bnz edit` (alias `bnz set`), `bnz type`, `bnz priority` (`pri`), `bnz severity` (`sev`), and `bnz assign`:
 
+- **Vulnerability <-> Bug, Priority & Severity**: pass `--bug` / `--vuln` / `-t <type>`, `-p <P0..P4|0..4>` / `--p0`..`--p4`, and `-S <S0..S4|0..4>` / `--s0`..`--s4` (or positional tokens like `bnz edit <id> bug P2 S4`). Downgrading `Vulnerability -> Bug` updates `Type`, `Priority`, `Severity`, and any comment atomically in one `ModifyIssue` RPC; promoting `Bug -> Vulnerability` on Chromium calls Buganizer's `markAsVulnerability` RPC so view restrictions and `security@chromium.org` collaboration are applied.
 - **Assignee <-> Status invariants**: assigning a `New` bug automatically transitions `Status` to `Assigned`; unassigning (`none` or `bnz unassign`) an `Assigned` or `In Progress` bug transitions `Status` to `New`.
 - **`Code Changes`**: pass a full Gerrit URL including the repository path (e.g. `https://chromium-review.googlesource.com/c/v8/v8/+/8691333`) or a numeric Critique CL ID. Buganizer rejects shortened `crrev.com/c/<cl>` links in `Code Changes`.
 - **Custom fields (`OS`, `Safe Merge`, `Merge-Request`, `Found In`, etc.)**: match case-insensitively by field name or numeric `customFieldId`. Enum choices are validated against the issue's component schema before sending any write RPC.

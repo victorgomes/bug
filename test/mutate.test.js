@@ -19,12 +19,13 @@ import {
 } from '../bnz.js';
 import { AuthRequiredError } from '../lib/browser.js';
 import { readCache, writeCache } from '../lib/cache.js';
-import { ISSUE_STATUSES } from '../lib/fetch.js';
+import { ISSUE_STATUSES, ISSUE_TYPES } from '../lib/fetch.js';
 import {
   assignIssue,
   buildCreateCommentPayload,
   buildCustomFieldClearJspb,
   buildCustomFieldValueJspb,
+  buildMarkAsVulnerabilityPayload,
   buildModifyIssuePayload,
   closeIssue,
   commentIssue,
@@ -35,11 +36,15 @@ import {
   parseCodeChangeEntry,
   parseIssueFetchResponse,
   resolveCloseStatus,
+  resolveIssueType,
+  resolvePriority,
+  resolveSeverity,
 } from '../lib/mutate.js';
 import { HANDLERS, TOOLS } from '../mcp-server/server.js';
 
 function makeIssueFetchJspb({
   id = 999000111,
+  trackerId = 157,
   componentId = 1456355,
   statusId = 1,
   priorityId = 2,
@@ -77,6 +82,7 @@ function makeIssueFetchJspb({
   const issueTuple = [null, Number(id), core];
   if (customFieldDefs.length) issueTuple[14] = customFieldDefs;
   if (visibleCustomIds.length) issueTuple[33] = visibleCustomIds.map((cid) => [Number(cid)]);
+  if (trackerId !== null && trackerId !== undefined) issueTuple[41] = Number(trackerId);
 
   const container = [];
   container[22] = issueTuple;
@@ -420,7 +426,7 @@ test('CLI parseArgs, prepareCommentInvocation, prepareCloseInvocation, and markd
   // Rejections
   assert.throws(() => parseArgs(['close', '123', '--fixed', '--obsolete']), /Conflicting statuses/);
   assert.throws(() => parseArgs(['123', '--fixed']), /require `bnz close` or `bnz edit`/);
-  assert.throws(() => parseArgs(['123', '-m', 'hi']), /require `bnz comment`, `bnz close`, `bnz assign`, or `bnz edit`/);
+  assert.throws(() => parseArgs(['123', '-m', 'hi']), /require `bnz comment`, `bnz close`, `bnz assign`, `bnz edit`/);
   assert.throws(() => parseArgs(['comment', '123', '-m', 'a', '-F', 'b']), /Cannot combine/);
 
   // Markdown rendering
@@ -911,5 +917,246 @@ test('MCP bnz_fields and bnz_edit handlers inspect and preview field updates', a
   assert.deepEqual(
     editJson[0].changes.find((c) => c.field === 'Code Changes').after,
     ['https://chromium-review.googlesource.com/c/v8/v8/+/8691333'],
+  );
+});
+
+test('ISSUE_TYPES, resolveIssueType, resolvePriority, and resolveSeverity support Buganizer enums and shorthands', () => {
+  assert.equal(ISSUE_TYPES[1], 'Bug');
+  assert.equal(ISSUE_TYPES[6], 'Vulnerability');
+  assert.equal(ISSUE_TYPES[8], 'Portfolio');
+  assert.equal(ISSUE_TYPES[11], 'Feature');
+  assert.equal(ISSUE_TYPES[15], 'Task');
+
+  assert.equal(resolveIssueType('bug').id, 1);
+  assert.equal(resolveIssueType('Vulnerability').id, 6);
+  assert.equal(resolveIssueType('vuln').id, 6);
+  assert.equal(resolveIssueType('Feature Request').id, 2);
+
+  assert.deepEqual(resolvePriority('P0'), { id: 1, label: 'P0' });
+  assert.deepEqual(resolvePriority('p2'), { id: 3, label: 'P2' });
+  assert.deepEqual(resolvePriority('2'), { id: 3, label: 'P2' });
+  assert.deepEqual(resolvePriority(4), { id: 5, label: 'P4' });
+  assert.throws(() => resolvePriority('P5'), /Invalid priority/);
+
+  assert.deepEqual(resolveSeverity('S0'), { id: 1, label: 'S0' });
+  assert.deepEqual(resolveSeverity('s4'), { id: 5, label: 'S4' });
+  assert.deepEqual(resolveSeverity('4'), { id: 5, label: 'S4' });
+  assert.deepEqual(resolveSeverity(1), { id: 2, label: 'S1' });
+  assert.throws(() => resolveSeverity('S5'), /Invalid severity/);
+
+  assert.deepEqual(
+    buildMarkAsVulnerabilityPayload(577305517),
+    ['b.MarkAsVulnerabilityRequest', null, null, [577305517, [['security@chromium.org']]]],
+  );
+});
+
+test('editIssue downgrades Vulnerability -> Bug atomically with Priority/Severity and uses markAsVulnerability for Bug -> Vulnerability on Chromium', async () => {
+  const id = '999999999020';
+  const url = `https://issuetracker.google.com/issues/${id}`;
+  try {
+    // 1. Downgrade Vulnerability (6) -> Bug (1) + P1 -> P2 + S1 -> S4 + comment in one atomic ModifyIssue RPC.
+    const sDowngrade = makeMockSession(async (path) => {
+      if (path.endsWith('/getIssue')) {
+        return {
+          text: makeIssueFetchJspb({
+            id,
+            trackerId: 157,
+            typeId: 6, // Vulnerability
+            statusId: 2,
+            priorityId: 2, // P1
+            severityId: 2, // S1
+            assignee: 'victorgomes@chromium.org',
+            collaborators: ['security@chromium.org'],
+          }),
+        };
+      }
+      return {
+        text: makeIssueFetchJspb({
+          id,
+          trackerId: 157,
+          typeId: 1, // Bug
+          statusId: 2,
+          priorityId: 3, // P2
+          severityId: 5, // S4
+          assignee: 'victorgomes@chromium.org',
+          collaborators: ['security@chromium.org'],
+        }),
+      };
+    });
+
+    const downRes = await editIssue(sDowngrade, id, {
+      type: 'bug',
+      priority: 'P2',
+      severity: 'S4',
+      comment: 'DCHECK-only failure, not a security vulnerability.',
+    });
+    assert.equal(sDowngrade.calls.length, 2);
+    assert.equal(sDowngrade.calls[1].path, `/action/issues/${id}`);
+    const downMod = sDowngrade.calls[1].body[6];
+    assert.deepEqual(downMod[1], [['type', 'priority', 'severity']]);
+    assert.equal(downMod[2][1], 1); // Bug
+    assert.equal(downMod[2][3], 3); // P2
+    assert.equal(downMod[2][4], 5); // S4
+    assert.equal(downMod[5][0], 'DCHECK-only failure, not a security vulnerability.');
+    assert.equal(downRes.type, 'Bug');
+    assert.equal(downRes.priority, 'P2');
+    assert.equal(downRes.severity, 'S4');
+    assert.deepEqual(downRes.changes, [
+      { field: 'Type', before: 'Vulnerability', after: 'Bug' },
+      { field: 'Priority', before: 'P1', after: 'P2' },
+      { field: 'Severity', before: 'S1', after: 'S4' },
+    ]);
+
+    // 2. Promote Bug (1) -> Vulnerability (6) on Chromium (trackerId 157) with P1/S1 + comment:
+    //    calls /markAsVulnerability first, then sends ModifyIssue for priority + severity + comment.
+    const sPromote = makeMockSession(async (path) => {
+      if (path.endsWith('/getIssue')) {
+        return {
+          text: makeIssueFetchJspb({
+            id,
+            trackerId: 157,
+            typeId: 1, // Bug
+            statusId: 2,
+            priorityId: 3, // P2
+            severityId: 5, // S4
+            assignee: 'victorgomes@chromium.org',
+          }),
+        };
+      }
+      if (path.endsWith('/markAsVulnerability')) {
+        return { text: `)]}'\n[]` };
+      }
+      return {
+        text: makeIssueFetchJspb({
+          id,
+          trackerId: 157,
+          typeId: 6, // Vulnerability
+          statusId: 2,
+          priorityId: 2, // P1
+          severityId: 2, // S1
+          assignee: 'victorgomes@chromium.org',
+          collaborators: ['security@chromium.org'],
+        }),
+      };
+    });
+
+    const promRes = await editIssue(sPromote, id, {
+      type: 'vuln',
+      priority: '1',
+      severity: '1',
+      comment: 'Exploitable OOB write.',
+    });
+    assert.equal(sPromote.calls.length, 3);
+    assert.equal(sPromote.calls[1].path, `/action/issues/${id}/markAsVulnerability`);
+    assert.deepEqual(sPromote.calls[1].body, [
+      'b.MarkAsVulnerabilityRequest',
+      null,
+      null,
+      [Number(id), [['security@chromium.org']]],
+    ]);
+    assert.equal(sPromote.calls[2].path, `/action/issues/${id}`);
+    const promMod = sPromote.calls[2].body[6];
+    assert.deepEqual(promMod[1], [['priority', 'severity']]);
+    assert.equal(promMod[2][3], 2); // P1
+    assert.equal(promMod[2][4], 2); // S1
+    assert.equal(promMod[5][0], 'Exploitable OOB write.');
+    assert.equal(promRes.type, 'Vulnerability');
+    assert.equal(promRes.priority, 'P1');
+    assert.equal(promRes.severity, 'S1');
+
+    // 3. Non-Chromium tracker (trackerId 999) uses standard ModifyIssue for Bug -> Vulnerability.
+    const sInternal = makeMockSession(async (path) => {
+      if (path.endsWith('/getIssue')) {
+        return {
+          text: makeIssueFetchJspb({ id, trackerId: 999, typeId: 1, statusId: 2, assignee: 'me@google.com' }),
+        };
+      }
+      return {
+        text: makeIssueFetchJspb({ id, trackerId: 999, typeId: 6, statusId: 2, assignee: 'me@google.com' }),
+      };
+    });
+    await editIssue(sInternal, id, { type: 'vulnerability' });
+    assert.equal(sInternal.calls.length, 2);
+    assert.equal(sInternal.calls[1].path, `/action/issues/${id}`);
+    assert.deepEqual(sInternal.calls[1].body[6][1], [['type']]);
+    assert.equal(sInternal.calls[1].body[6][2][1], 6);
+  } finally {
+    invalidateIssueCache(url);
+  }
+});
+
+test('CLI supports `bnz type`, `bnz priority`/`pri`, `bnz severity`/`sev`, shorthands, and positional triage tokens', () => {
+  // 1. Flag shorthands on `bnz edit` (`--bug`, `-p`, `-S`, `--p2`, `--s4`)
+  const a1 = parseArgs(['edit', '577305517', '--bug', '-p', 'P2', '-S', 'S4', '-m', 'Not a vuln']);
+  const p1 = prepareEditInvocation(a1._.slice(1), a1);
+  assert.deepEqual(p1.targets, ['577305517']);
+  assert.equal(p1.type, 'bug');
+  assert.equal(p1.priority, 'P2');
+  assert.equal(p1.severity, 'S4');
+  assert.equal(p1.comment, 'Not a vuln');
+
+  const a2 = parseArgs(['edit', '577305517', '--vuln', '--p1', '--s1']);
+  const p2 = prepareEditInvocation(a2._.slice(1), a2);
+  assert.equal(p2.type, 'vulnerability');
+  assert.equal(p2.priority, 'P1');
+  assert.equal(p2.severity, 'S1');
+
+  // 2. Positional triage tokens on `bnz edit` (`bnz edit <id> bug P2 S4`)
+  const a3 = parseArgs(['edit', 'b/577305517', 'bug', 'P2', 'S4']);
+  const p3 = prepareEditInvocation(a3._.slice(1), a3);
+  assert.deepEqual(p3.targets, ['b/577305517']);
+  assert.equal(p3.type, 'bug');
+  assert.equal(p3.priority, 'P2');
+  assert.equal(p3.severity, 'S4');
+
+  // 3. Dedicated `bnz type`, `bnz priority`/`pri`, `bnz severity`/`sev` subcommands
+  const aType = parseArgs(['type', '577305517', 'bug', '-p', 'P2', '-S', 'S4']);
+  const pType = prepareEditInvocation(aType._.slice(1), aType, { mode: 'type', cmdName: 'type' });
+  assert.deepEqual(pType.targets, ['577305517']);
+  assert.equal(pType.type, 'bug');
+  assert.equal(pType.priority, 'P2');
+  assert.equal(pType.severity, 'S4');
+
+  const aPri = parseArgs(['pri', '577305517, 577428169', '2']);
+  const pPri = prepareEditInvocation(aPri._.slice(1), aPri, { mode: 'priority', cmdName: 'pri' });
+  assert.deepEqual(pPri.targets, ['577305517', '577428169']);
+  assert.equal(pPri.priority, '2');
+
+  const aSev = parseArgs(['sev', '577305517', '4']);
+  const pSev = prepareEditInvocation(aSev._.slice(1), aSev, { mode: 'severity', cmdName: 'sev' });
+  assert.deepEqual(pSev.targets, ['577305517']);
+  assert.equal(pSev.severity, '4');
+
+  // 4. Conflict & missing-value errors
+  assert.throws(() => parseArgs(['edit', '577305517', '--bug', '--vuln']), /Conflicting issue types/);
+  assert.throws(() => parseArgs(['edit', '577305517', '--p1', '--p2']), /Conflicting priorities/);
+  assert.throws(() => parseArgs(['edit', '577305517', '--s1', '--s4']), /Conflicting severities/);
+  assert.throws(
+    () => {
+      const a = parseArgs(['priority', '577305517', 'P1', '--p2']);
+      prepareEditInvocation(a._.slice(1), a, { mode: 'priority', cmdName: 'priority' });
+    },
+    /Conflicting priorities/,
+  );
+  assert.throws(
+    () => {
+      const a = parseArgs(['type', '577305517']);
+      prepareEditInvocation(a._.slice(1), a, { mode: 'type', cmdName: 'type' });
+    },
+    /`bnz type` requires an issue type/,
+  );
+  assert.throws(
+    () => {
+      const a = parseArgs(['priority', '577305517']);
+      prepareEditInvocation(a._.slice(1), a, { mode: 'priority', cmdName: 'priority' });
+    },
+    /`bnz priority` requires a priority/,
+  );
+  assert.throws(
+    () => {
+      const a = parseArgs(['severity', '577305517']);
+      prepareEditInvocation(a._.slice(1), a, { mode: 'severity', cmdName: 'severity' });
+    },
+    /`bnz severity` requires a severity/,
   );
 });
