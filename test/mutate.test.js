@@ -21,6 +21,7 @@ import { AuthRequiredError } from '../lib/browser.js';
 import { readCache, writeCache } from '../lib/cache.js';
 import { ISSUE_STATUSES, ISSUE_TYPES } from '../lib/fetch.js';
 import {
+  BNZ_COMMENT_FOOTER,
   assignIssue,
   buildCreateCommentPayload,
   buildCustomFieldClearJspb,
@@ -32,6 +33,7 @@ import {
   editIssue,
   extractRpcErrorMessage,
   fetchIssueFields,
+  formatCommentWithFooter,
   invalidateIssueCache,
   parseCodeChangeEntry,
   parseIssueFetchResponse,
@@ -178,14 +180,25 @@ test('extractRpcErrorMessage and parseIssueFetchResponse handle XSSI responses',
   assert.equal(parsed.assignee, 'owner@chromium.org');
 });
 
-test('buildCreateCommentPayload and buildModifyIssuePayload build Buganizer JSPB arrays', () => {
+test('buildCreateCommentPayload and buildModifyIssuePayload build Buganizer JSPB arrays with bnz footer', () => {
+  assert.equal(BNZ_COMMENT_FOOTER, '---\n*Comment created using bnz*');
+  assert.equal(
+    formatCommentWithFooter('Hello **world**\n\n'),
+    'Hello **world**\n\n---\n*Comment created using bnz*',
+  );
+  // Idempotent when footer is already present
+  assert.equal(
+    formatCommentWithFooter('Hello **world**\n\n---\n*Comment created using bnz*\n'),
+    'Hello **world**\n\n---\n*Comment created using bnz*',
+  );
+
   assert.deepEqual(
     buildCreateCommentPayload('123', 'Hello **world**', { markdown: true }),
-    [null, null, null, null, [123, ['Hello **world**', null, null, null, null, null, null, null, 2]]],
+    [null, null, null, null, [123, ['Hello **world**\n\n---\n*Comment created using bnz*', null, null, null, null, null, null, null, 2]]],
   );
   assert.deepEqual(
     buildCreateCommentPayload('123', 'Plain text', { markdown: false }),
-    [null, null, null, null, [123, ['Plain text', null, null, null, null, null, null, null, 1]]],
+    [null, null, null, null, [123, ['Plain text\n\n---\n*Comment created using bnz*', null, null, null, null, null, null, null, 1]]],
   );
 
   const mod = buildModifyIssuePayload('123', {
@@ -202,7 +215,7 @@ test('buildCreateCommentPayload and buildModifyIssuePayload build Buganizer JSPB
       [null, null, 4, null, null, null, null, ['me@chromium.org']],
       [],
       [],
-      ['Fixed in CL 1', null, null, null, null, null, null, null, 2],
+      ['Fixed in CL 1\n\n---\n*Comment created using bnz*', null, null, null, null, null, null, null, 2],
     ],
   ]);
 });
@@ -227,6 +240,7 @@ test('commentIssue posts comment, supports dry-run, and invalidates local cache'
     assert.equal(drySession.calls.length, 1);
     assert.equal(dryRes.dryRun, true);
     assert.equal(dryRes.title, 'Dry-run bug');
+    assert.equal(dryRes.comment, 'Preview note\n\n---\n*Comment created using bnz*');
     // Dry run must NOT invalidate existing cache or post a comment.
     assert.ok(readCache(url));
 
@@ -239,9 +253,11 @@ test('commentIssue posts comment, supports dry-run, and invalidates local cache'
       markdown: false,
     });
     assert.equal(liveSession.calls.length, 1);
+    assert.equal(liveSession.calls[0].body[4][1][0], 'Posted comment\n\n---\n*Comment created using bnz*');
     assert.equal(liveSession.calls[0].body[4][1][8], 1); // plain formattingMode
     assert.equal(liveRes.dryRun, false);
     assert.equal(liveRes.markdown, false);
+    assert.equal(liveRes.comment, 'Posted comment\n\n---\n*Comment created using bnz*');
     assert.equal(readCache(url), null);
     assert.equal(readCache(url + '#full'), null);
   } finally {
@@ -278,7 +294,7 @@ test('closeIssue auto-assigns unassigned Fixed/Verified bugs, leaves WontFix una
     assert.deepEqual(sFixed.calls[1].body[6][1], [['status', 'assignee']]);
     assert.equal(sFixed.calls[1].body[6][2][2], 4);
     assert.deepEqual(sFixed.calls[1].body[6][2][7], ['victorgomes@chromium.org']);
-    assert.equal(sFixed.calls[1].body[6][5][0], 'Landed fix.');
+    assert.equal(sFixed.calls[1].body[6][5][0], 'Landed fix.\n\n---\n*Comment created using bnz*');
 
     // 2. Unassigned "New" bug closed as Won't fix (Intended behavior) -> no auto-assign.
     const sWai = makeMockSession(async (path) => {
@@ -341,7 +357,7 @@ test('closeIssue marks duplicate via /mark_as_duplicate, validates canonical tar
         return { text: makeIssueFetchJspb({ id: srcId, statusId: 10, title: 'Dup bug' }) };
       }
       if (path === `/action/issues/${srcId}/comment`) {
-        assert.equal(body[4][1][0], 'Same root cause.');
+        assert.equal(body[4][1][0], 'Same root cause.\n\n---\n*Comment created using bnz*');
         return { text: `)]}'\n[]` };
       }
       assert.fail(`Unexpected RPC path: ${path}`);
@@ -997,7 +1013,10 @@ test('editIssue downgrades Vulnerability -> Bug atomically with Priority/Severit
     assert.equal(downMod[2][1], 1); // Bug
     assert.equal(downMod[2][3], 3); // P2
     assert.equal(downMod[2][4], 5); // S4
-    assert.equal(downMod[5][0], 'DCHECK-only failure, not a security vulnerability.');
+    assert.equal(
+      downMod[5][0],
+      'DCHECK-only failure, not a security vulnerability.\n\n---\n*Comment created using bnz*',
+    );
     assert.equal(downRes.type, 'Bug');
     assert.equal(downRes.priority, 'P2');
     assert.equal(downRes.severity, 'S4');
@@ -1059,7 +1078,7 @@ test('editIssue downgrades Vulnerability -> Bug atomically with Priority/Severit
     assert.deepEqual(promMod[1], [['priority', 'severity']]);
     assert.equal(promMod[2][3], 2); // P1
     assert.equal(promMod[2][4], 2); // S1
-    assert.equal(promMod[5][0], 'Exploitable OOB write.');
+    assert.equal(promMod[5][0], 'Exploitable OOB write.\n\n---\n*Comment created using bnz*');
     assert.equal(promRes.type, 'Vulnerability');
     assert.equal(promRes.priority, 'P1');
     assert.equal(promRes.severity, 'S1');

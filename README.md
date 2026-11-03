@@ -105,8 +105,9 @@ bnz comment 505610970 -m "Preview only" --dry-run
 ```
 
 Comments are formatted as **Markdown** by default (`--plain` switches to plain
-text) and immediately invalidate the local issue cache so a follow-up `bnz <id>`
-fetches the updated thread.
+text), automatically append a `---\n*Comment created using bnz*` footer, and
+immediately invalidate the local issue cache so a follow-up `bnz <id>` fetches
+the updated thread.
 
 ### Close an issue
 
