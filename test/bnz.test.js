@@ -246,7 +246,7 @@ test('parseIssueSearchPayload, computeIssueSlo, and renderListMarkdown (--slo) g
       [null, 10, [1, 1, 2, 2, 3, 'PostMortem for 999 - deopt bug', null, ['me@chromium.org'], null, null, null, null, null, null, []], null, [nowSec - 72 * day, 0], [nowSec - 56 * day, 0], null, null, [], null, null, null, null, null, []],
       [null, 20, [1, 6, 2, 2, 2, '[Merge M158] WriteBarrier', null, ['me@chromium.org'], null, null, null, null, null, null, [[1223087, null, null, null, null, null, null, null, null, 'Pending']]], null, [nowSec - 1 * day, 0], [nowSec - 1 * day, 0], null, null, [], null, null, null, null, null, [[1223087, 1, 1, null, 'Merge']]],
       [null, 30, [1, 6, 2, 2, 3, 'S2 vulnerability in Maglev', null, ['me@chromium.org'], null, null, null, null, null, null, []], null, [nowSec - 8 * day, 0], [nowSec, 0], null, null, [], null, null, null, null, null, []],
-      [null, 40, [1, 1, 2, 3, 3, 'Normal P2 cleanup bug', null, ['me@chromium.org'], null, null, null, null, null, null, []], null, [nowSec - 10 * day, 0], [nowSec - 5 * day, 0], null, null, [], null, null, null, null, null, []],
+      [null, 40, [1, 1, 2, 3, 3, 'Normal P2 cleanup bug', null, ['me@chromium.org'], null, null, null, null, null, null, []], null, [nowSec - 10 * day, 0], [nowSec - 5 * day, 0], [nowSec - 6 * day, 0], [nowSec - 5 * day, 0], [], null, null, null, null, null, []],
     ]],
   ]]);
 
@@ -254,6 +254,8 @@ test('parseIssueSearchPayload, computeIssueSlo, and renderListMarkdown (--slo) g
   assert.equal(parsed.length, 4);
   assert.equal(parsed[1].customFields.Merge, 'Pending');
   assert.equal(parsed[2].severity, 'S2');
+  assert.equal(parsed[3].resolvedMs, (nowSec - 6 * day) * 1000);
+  assert.equal(parsed[3].verifiedMs, (nowSec - 5 * day) * 1000);
 
   const sorted = sortHitsBySlo(parsed, nowMs);
   assert.deepEqual(sorted.map((h) => h.id), ['10', '20', '30', '40']);
