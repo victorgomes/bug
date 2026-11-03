@@ -58,23 +58,28 @@ Each service is a one-time headed-browser login. The session is stored in a
 persistent Playwright profile at `~/.config/bnz/profile`.
 
 ```sh
-bnz login        # log into issuetracker.google.com
-bnz cf login     # log into clusterfuzz.com
+bnz login             # log into issuetracker.google.com
+bnz cf login          # log into clusterfuzz.com
+bnz login --with-cf   # open both in one browser window
 ```
 
 Both services use Google SSO, so logging into one usually carries the other —
-but running both is harmless and ensures cookies are warm.
+but running both (or `--with-cf`) ensures cookies for both origins are warm.
 
 To authenticate a headless remote workstation where hardware security keys are
-unavailable, push your local session directly over SSH (assumes `bnz` is
-installed on both machines):
+unavailable, mint a dedicated remote session in an isolated temporary profile
+and push it over SSH (assumes `bnz` is installed on both machines):
 
 ```sh
-bnz login --export=corp        # logs in locally if needed, then imports on `corp` via ssh
-bnz cf login --export=corp     # same for clusterfuzz.com
+bnz login --with-cf --export=corp   # mints an isolated session (Buganizer + CF) and imports on `corp`
+bnz login --export=corp             # Buganizer only (preserves existing CF cookies on `corp`)
+bnz cf login --export=corp          # ClusterFuzz only (preserves existing Buganizer cookies on `corp`)
 ```
 
-You can also pipe or save session JSON manually with `bnz login --export` and
+`--export` never exports `~/.config/bnz/profile` directly, so the local and
+remote machines each get their own independent Google `SID` / `__Secure-1PSIDTS`
+cookie chain and never invalidate each other during cookie rotation. You can
+also pipe or save session JSON manually with `bnz login --export` and
 `bnz login --import[=FILE]`.
 
 ## Usage

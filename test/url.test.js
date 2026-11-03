@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  ATTACHMENT_URL_RE, isIssueUrl, resolveCfTarget, resolveIssueUrl,
-  resolveTestcaseKey, searchUrl,
+  ATTACHMENT_URL_RE, chromiumIssueUrl, chromiumSearchUrl, isIssueUrl,
+  resolveCfTarget, resolveIssueUrl, resolveTestcaseKey, searchUrl,
 } from '../lib/url.js';
 
 test('resolves only known https issue URLs', () => {
@@ -97,5 +97,13 @@ test('search URL encodes the query', () => {
   assert.equal(
     searchUrl('reporter:me status:open'),
     'https://issuetracker.google.com/issues?q=reporter%3Ame%20status%3Aopen',
+  );
+  assert.equal(
+    chromiumIssueUrl('577834301'),
+    'https://issues.chromium.org/u/1/issues/577834301',
+  );
+  assert.equal(
+    chromiumSearchUrl('assignee:me status:open'),
+    'https://issues.chromium.org/u/1/issues?q=assignee%3Ame%20status%3Aopen',
   );
 });

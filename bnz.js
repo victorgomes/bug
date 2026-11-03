@@ -26,7 +26,7 @@ import {
   tryResolveIssueType,
 } from './lib/mutate.js';
 import {
-  resolveCfTarget, resolveIssueUrl,
+  chromiumIssueUrl, chromiumSearchUrl, resolveCfTarget, resolveIssueUrl,
 } from './lib/url.js';
 import {
   appendix, header, makeColors, sanitizeDeep, sanitizeTerminalText,
@@ -41,10 +41,10 @@ function usage() {
   console.error(`bnz — fetch Buganizer issues and ClusterFuzz testcases as markdown.
 
 Usage:
-  bnz login                              Interactive Google SSO for issuetracker (one-time).
-  bnz login --export[=SSH_HOST]          Export session cookies to SSH_HOST (or stdout).
+  bnz login [--with-cf]                  Interactive Google SSO for issuetracker (and clusterfuzz).
+  bnz login [--with-cf] --export[=HOST]  Mint an isolated remote session and push to SSH HOST (or stdout).
   bnz login --import[=FILE]              Import session cookies from stdin (or FILE).
-  bnz cf login                           Interactive Google SSO for clusterfuzz (one-time).
+  bnz cf login [--export[=HOST]]         Interactive Google SSO for clusterfuzz (local or isolated export).
 
   bnz <id|url> [<id|url>...]             Fetch one or more issues.
   bnz fields <id|url> [...] [--full]     List standard and custom fields + allowed values.
@@ -132,8 +132,9 @@ Flags:
   --refresh                              Bypass the cache for this fetch (still writes back).
   --no-cache                             Disable cache reads and writes.
   --debug                                Include raw HTML in json output.
-  --export[=SSH_HOST]                    login: push local session cookies to SSH_HOST via ssh
-                                         (or print JSON to stdout if SSH_HOST is omitted).
+  --with-cf                              login: open both issuetracker and clusterfuzz in one browser.
+  --export[=SSH_HOST]                    login: mint an isolated remote session (never shares local
+                                         profile) and push cookies to SSH_HOST (or JSON to stdout).
   --import[=FILE]                        login: import session JSON from stdin (or FILE).
   --no-color                             Disable ANSI color (also honors NO_COLOR).
   -h, --help                             Show this help.
@@ -296,6 +297,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--download-attachments=')) {
       args.downloadAttachments = a.slice('--download-attachments='.length);
     }
+    else if (a === '--with-cf') args.withCf = true;
     else if (a === '--export') args.export = '-';
     else if (a.startsWith('--export=')) args.export = a.slice('--export='.length);
     else if (a === '--import') args.import = '-';
@@ -516,6 +518,12 @@ function parseArgs(argv) {
     if ((args.export || args.import) && !isLogin) {
       throw new Error('--export and --import require login');
     }
+    if (args.withCf && cmd !== 'login') {
+      throw new Error('--with-cf requires `bnz login`');
+    }
+    if (args.withCf && args.import) {
+      throw new Error('Cannot combine --with-cf and --import');
+    }
     if (isLogin) {
       const rest = cmd === 'cf' ? args._.slice(2) : args._.slice(1);
       if (rest.length) throw new Error(`Unexpected argument to login: ${rest[0]}`);
@@ -574,7 +582,8 @@ function renderIssueMarkdown(issue, args, colorEnabled) {
   const c = makeColors(colorEnabled);
   const data = sanitizeDeep(issue);
   const out = [];
-  out.push(header(c, `Issue ${data.id}`, data.finalUrl || data.url));
+  const displayUrl = data.id ? chromiumIssueUrl(data.id) : (data.finalUrl || data.url);
+  out.push(header(c, `Issue ${data.id}`, displayUrl));
   const s = summaryFromMarkdown(data.markdown);
   const summary = [
     s.status && `${c.bold('Status')}: ${
@@ -667,8 +676,9 @@ function renderSloTable(hits, c, colorEnabled) {
     const slo = h.slo || computeIssueSlo(h);
     const priSev = [h.priority, h.severity].filter(Boolean).join('/') || '—';
     const esc = (s) => String(s).replace(/\|/g, '\\|');
+    const issueUrl = h.id ? chromiumIssueUrl(h.id) : h.url;
     const cells = [
-      `[${esc(h.id)}](${h.url})`,
+      `[${esc(h.id)}](${issueUrl})`,
       esc(priSev),
       esc(slo.rule),
       esc(formatSloDue(slo.closureDue, slo.closureRemDays, c, colorEnabled)),
@@ -682,7 +692,8 @@ function renderSloTable(hits, c, colorEnabled) {
 
 function renderSloListMarkdown(data, c, colorEnabled) {
   const out = [];
-  out.push(header(c, `Search (by SLO): ${data.query}`, data.searchUrl));
+  const displaySearchUrl = data.query ? chromiumSearchUrl(data.query) : data.searchUrl;
+  out.push(header(c, `Search (by SLO): ${data.query}`, displaySearchUrl));
   if (!data.hits.length) {
     out.push(c.dim('(no results)'));
     if (data.since && data.filteredOut) {
@@ -730,7 +741,7 @@ function renderSloListMarkdown(data, c, colorEnabled) {
       byPri.get(k).push(h);
     }
     for (const [pri, group] of byPri) {
-      const links = group.map((h) => `[${h.id}](${h.url})`).join(', ');
+      const links = group.map((h) => `[${h.id}](${h.id ? chromiumIssueUrl(h.id) : h.url})`).join(', ');
       out.push(`- **${pri}** (${group.length}): ${links}`);
     }
   }
@@ -744,7 +755,8 @@ function renderListMarkdown(search, args, colorEnabled) {
     return renderSloListMarkdown(data, c, colorEnabled);
   }
   const out = [];
-  out.push(header(c, `Search: ${data.query}`, data.searchUrl));
+  const displaySearchUrl = data.query ? chromiumSearchUrl(data.query) : data.searchUrl;
+  out.push(header(c, `Search: ${data.query}`, displaySearchUrl));
   if (!data.hits.length) {
     out.push(c.dim('(no results)'));
     if (data.since && data.filteredOut) {
@@ -764,11 +776,12 @@ function renderListMarkdown(search, args, colorEnabled) {
     out.push('| Pri | Type | Status | Title | Assignee | Modified |');
     out.push('| --- | --- | --- | --- | --- | --- |');
     for (const h of data.hits) {
+      const issueUrl = h.id ? chromiumIssueUrl(h.id) : h.url;
       const cells = [
         h.priority || '',
         h.type || '',
         h.status || '',
-        `[${h.title}](${h.url})`,
+        `[${h.title}](${issueUrl})`,
         h.assignee || '',
         h.modified || '',
       ].map((s) => String(s).replace(/\|/g, '\\|'));
@@ -776,7 +789,8 @@ function renderListMarkdown(search, args, colorEnabled) {
     }
   } else {
     for (const h of data.hits) {
-      out.push(`- [${h.id}](${h.url}) - ${h.title}`);
+      const issueUrl = h.id ? chromiumIssueUrl(h.id) : h.url;
+      out.push(`- [${h.id}](${issueUrl}) - ${h.title}`);
     }
   }
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
@@ -790,7 +804,7 @@ function renderCommentMarkdown(result, colorEnabled) {
   const title = data.dryRun
     ? `Dry run: Comment on Issue ${data.id}`
     : `Commented on Issue ${data.id}`;
-  const out = [header(c, title, data.url)];
+  const out = [header(c, title, data.id ? chromiumIssueUrl(data.id) : data.url)];
   if (data.title) out.push(`- **Title**: ${data.title}`);
   if (data.status) out.push(`- **Status**: ${data.status}`);
   out.push(`- **Format**: ${data.markdown ? 'Markdown' : 'Plain text'}`);
@@ -805,7 +819,7 @@ function renderCloseMarkdown(result, colorEnabled) {
   const title = data.dryRun
     ? `Dry run: Close Issue ${data.id}`
     : `Closed Issue ${data.id}`;
-  const out = [header(c, title, data.url)];
+  const out = [header(c, title, data.id ? chromiumIssueUrl(data.id) : data.url)];
   if (data.title) out.push(`- **Title**: ${data.title}`);
   const styledStatus = /Fixed|Verified/i.test(data.status)
     ? c.green(data.status)
@@ -815,7 +829,7 @@ function renderCloseMarkdown(result, colorEnabled) {
     : styledStatus;
   out.push(`- **Status**: ${transition}`);
   if (data.duplicateOf) {
-    const dupUrl = data.duplicateOfUrl || `https://issuetracker.google.com/issues/${data.duplicateOf}`;
+    const dupUrl = chromiumIssueUrl(data.duplicateOf);
     const dupSuffix = data.duplicateOfTitle ? ` — ${data.duplicateOfTitle}` : '';
     out.push(`- **Duplicate of**: [${data.duplicateOf}](${dupUrl})${dupSuffix}`);
   }
@@ -855,7 +869,7 @@ function renderEditMarkdown(result, colorEnabled) {
       ? `Dry run: Edit Issue ${data.id}`
       : `Updated Issue ${data.id}`;
   }
-  const out = [header(c, title, data.url)];
+  const out = [header(c, title, data.id ? chromiumIssueUrl(data.id) : data.url)];
   if (data.title) out.push(`- **Title**: ${data.title}`);
   if (data.noOp) {
     out.push(`- **Changes**: ${c.dim('(no changes — requested values already match issue)')}`);
@@ -879,7 +893,7 @@ function renderEditMarkdown(result, colorEnabled) {
 function renderFieldsMarkdown(result, colorEnabled, { full = false } = {}) {
   const c = makeColors(colorEnabled);
   const data = sanitizeDeep(result);
-  const out = [header(c, `Fields for Issue ${data.id}`, data.url)];
+  const out = [header(c, `Fields for Issue ${data.id}`, data.id ? chromiumIssueUrl(data.id) : data.url)];
   if (data.title) out.push(`- **Title**: ${data.title}`);
   out.push('');
   out.push(c.bold('## Standard Fields'));
@@ -1535,7 +1549,7 @@ function emit(results, args, colorEnabled, mdFn) {
   console.log(results.map(mdFn).join(MARKDOWN_SEPARATOR));
 }
 
-async function loginCmd(startUrl, args) {
+async function loginCmd(startUrls, args) {
   if (args.import) {
     const raw = args.import === '-'
       ? readFileSync(0, 'utf8')
@@ -1545,7 +1559,7 @@ async function loginCmd(startUrl, args) {
     return;
   }
   if (args.export) {
-    const state = await exportSessionState({ startUrl });
+    const state = await exportSessionState({ startUrls });
     if (args.export === '-') {
       process.stdout.write(JSON.stringify(state) + '\n');
     } else {
@@ -1554,7 +1568,7 @@ async function loginCmd(startUrl, args) {
     }
     return;
   }
-  await loginInteractive(startUrl);
+  await loginInteractive(startUrls);
 }
 
 // ---------- main ----------
@@ -1571,11 +1585,14 @@ async function main() {
   const cmd = args._[0];
 
   if (cmd === 'login') {
-    await loginCmd('https://issuetracker.google.com/', args);
+    const urls = args.withCf
+      ? ['https://issuetracker.google.com/', 'https://clusterfuzz.com/']
+      : ['https://issuetracker.google.com/'];
+    await loginCmd(urls, args);
     return;
   }
   if (cmd === 'cf' && args._[1] === 'login') {
-    await loginCmd('https://clusterfuzz.com/', args);
+    await loginCmd(['https://clusterfuzz.com/'], args);
     return;
   }
 

@@ -9,7 +9,9 @@ import {
   parseArgs, parseSince, renderListMarkdown, sanitizeFilename,
 } from '../bnz.js';
 import {
-  exportSessionState, importSessionState, pushSessionOverSsh,
+  AuthRequiredError, PROFILE_DIR, clearAuthInvalid, exportSessionState,
+  importSessionState, isAnonymousBuganizerSession, markAuthInvalid,
+  pushSessionOverSsh, readAuthInvalid,
 } from '../lib/browser.js';
 import {
   DEFAULT_LIST_QUERY, computeIssueSlo, parseIssueSearchPayload, sortHitsBySlo,
@@ -117,6 +119,8 @@ test('sanitizeDeep recurses', () => {
 test('parseArgs handles login --export and --import flags and errors', () => {
   assert.equal(parseArgs(['login', '--export']).export, '-');
   assert.equal(parseArgs(['login', '--export=corp']).export, 'corp');
+  assert.equal(parseArgs(['login', '--with-cf']).withCf, true);
+  assert.equal(parseArgs(['login', '--with-cf', '--export=corp']).withCf, true);
   assert.equal(parseArgs(['cf', 'login', '--export=user@corp']).export, 'user@corp');
   assert.equal(parseArgs(['login', '--import']).import, '-');
   assert.equal(parseArgs(['login', '--import=/tmp/s.json']).import, '/tmp/s.json');
@@ -126,6 +130,8 @@ test('parseArgs handles login --export and --import flags and errors', () => {
   assert.throws(() => parseArgs(['login', '--export=bad host']), /Invalid SSH host/);
   assert.throws(() => parseArgs(['login', '--import=']), /Expected a file path/);
   assert.throws(() => parseArgs(['login', '--export=corp', '--import']), /Cannot combine/);
+  assert.throws(() => parseArgs(['login', '--with-cf', '--import']), /Cannot combine --with-cf and --import/);
+  assert.throws(() => parseArgs(['cf', 'login', '--with-cf']), /--with-cf requires `bnz login`/);
   assert.throws(() => parseArgs(['12345', '--export=corp']), /require login/);
   assert.throws(() => parseArgs(['login', 'corp']), /Unexpected argument to login/);
 });
@@ -273,4 +279,141 @@ test('parseIssueSearchPayload, computeIssueSlo, and renderListMarkdown (--slo) g
   assert.match(md, /## Due Within 7 Days \(1\)/);
   assert.match(md, /## In SLO \(1\)/);
   assert.match(md, /## Out of SLO Scope \(1\)/);
+  assert.match(md, /\[10\]\(https:\/\/issues\.chromium\.org\/u\/1\/issues\/10\)/);
+  assert.match(md, /\[40\]\(https:\/\/issues\.chromium\.org\/u\/1\/issues\/40\)/);
+  assert.match(md, /https:\/\/issues\.chromium\.org\/u\/1\/issues\?q=assignee%3Ame%20status%3Aopen/);
+});
+
+test('isAnonymousBuganizerSession detects signed-out or expired Buganizer sessions', () => {
+  // Anonymous / expired SSO payload from issuetracker.google.com
+  const anonSession = [
+    { toJSON: () => [null, null, '', true, 'ANONYMOUS'] },
+    null,
+    '',
+  ];
+  assert.equal(isAnonymousBuganizerSession(anonSession), true);
+
+  // Missing XSRF token
+  assert.equal(isAnonymousBuganizerSession([['victorgomes@chromium.org'], null, '']), true);
+
+  // Authenticated session
+  const authSession = [
+    { toJSON: () => ['victorgomes@chromium.org', null, 'Victor Gomes', false] },
+    null,
+    'xsrf_tok_123',
+  ];
+  assert.equal(isAnonymousBuganizerSession(authSession), false);
+
+  // Non-Buganizer page without buganizerSessionJspb
+  assert.equal(isAnonymousBuganizerSession(undefined), false);
+
+  const err = new AuthRequiredError(
+    'https://issuetracker.google.com/issues?q=assignee%3Ame%20status%3Aopen',
+    'anonymous Buganizer session / expired SSO',
+  );
+  assert.match(err.message, /anonymous Buganizer session \/ expired SSO/);
+  assert.match(err.message, /Run `bnz login`/);
+});
+
+test('importSessionState preserves unrelated service cookies and clears auth-invalid markers', async () => {
+  const dstDir = mkdtempSync(join(tmpdir(), 'bnz-test-scoped-'));
+  const markerPath = join(dstDir, 'auth-invalid.json');
+  try {
+    const expires = Math.floor(Date.now() / 1000) + 86400;
+    markAuthInvalid('bugs', { url: 'https://issuetracker.google.com/', reason: 'expired', markerPath });
+    markAuthInvalid('cf', { url: 'https://clusterfuzz.com/', reason: 'expired', markerPath });
+    assert.deepEqual(Object.keys(readAuthInvalid(markerPath)).sort(), ['bugs', 'cf']);
+
+    // 1. Import ClusterFuzz cookie -> clears only 'cf' marker.
+    await importSessionState({
+      cookies: [{
+        name: 'session',
+        value: 'cf_sess_1',
+        domain: 'clusterfuzz.com',
+        path: '/',
+        expires,
+        httpOnly: true,
+        secure: true,
+        sameSite: 'Lax',
+      }],
+    }, { profileDir: dstDir, authMarkerPath: markerPath });
+
+    assert.deepEqual(Object.keys(readAuthInvalid(markerPath)), ['bugs']);
+
+    // 2. Import Buganizer/Google cookies -> preserves ClusterFuzz cookie & clears 'bugs' marker.
+    await importSessionState({
+      cookies: [
+        {
+          name: '__Secure-1PSID',
+          value: 'google_sid_1',
+          domain: '.google.com',
+          path: '/',
+          expires,
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+        },
+        {
+          name: 'OSID',
+          value: 'bugs_osid_1',
+          domain: 'issuetracker.google.com',
+          path: '/',
+          expires,
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+        },
+      ],
+    }, { profileDir: dstDir, authMarkerPath: markerPath });
+
+    assert.deepEqual(readAuthInvalid(markerPath), {});
+    const afterBoth = await exportSessionState({ profileDir: dstDir });
+    assert.deepEqual(
+      afterBoth.cookies.map((c) => `${c.name}=${c.value}`).sort(),
+      ['OSID=bugs_osid_1', '__Secure-1PSID=google_sid_1', 'session=cf_sess_1'],
+    );
+
+    // 3. Re-importing updated ClusterFuzz cookie preserves Buganizer/Google cookies.
+    await importSessionState({
+      cookies: [{
+        name: 'session',
+        value: 'cf_sess_2',
+        domain: 'clusterfuzz.com',
+        path: '/',
+        expires,
+        httpOnly: true,
+        secure: true,
+        sameSite: 'Lax',
+      }],
+    }, { profileDir: dstDir, authMarkerPath: markerPath });
+
+    const afterCfRefresh = await exportSessionState({ profileDir: dstDir });
+    assert.deepEqual(
+      afterCfRefresh.cookies.map((c) => `${c.name}=${c.value}`).sort(),
+      ['OSID=bugs_osid_1', '__Secure-1PSID=google_sid_1', 'session=cf_sess_2'],
+    );
+
+    clearAuthInvalid(['bugs', 'cf'], { markerPath });
+  } finally {
+    rmSync(dstDir, { recursive: true, force: true });
+  }
+});
+
+test('exportSessionState without profileDir uses an ephemeral isolated profile', async () => {
+  let seenProfileDir = null;
+  const expires = Math.floor(Date.now() / 1000) + 86400;
+  // Pass a local data/about URL is not supported by verifyUrls, so test cf-only
+  // filtering on an explicit temp dir AND verify ephemeral dir isolation when
+  // loginFn cancels before SSO completes.
+  await assert.rejects(
+    exportSessionState({
+      startUrls: ['https://issuetracker.google.com/'],
+      loginFn: async (_urls, { profileDir }) => {
+        seenProfileDir = profileDir;
+      },
+    }),
+    /Browser closed before Google SSO completed/,
+  );
+  assert.ok(seenProfileDir, 'expected loginFn to be called with an ephemeral profileDir');
+  assert.notEqual(seenProfileDir, PROFILE_DIR);
 });
